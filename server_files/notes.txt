@@ -1,0 +1,152 @@
+go run ./cmd/client
+go run ./cmd/server
+
+
+
+  [Client]                                  [Server]
+     |                                          |
+     |-----(1) Initial Hello + Ephemeral Key -->|
+     |                                          |
+     |<----(2) Server Hello + Ephemeral Key ----|
+     |                                          |
+     |--(3) Encrypted Identity + Nonce -------->|
+     |                                          |
+     |<--(4) Encrypted Session OK + Nonce ------|
+     |                                          |
+     |====== SECURE CHANNEL ESTABLISHED =======|
+     |                                          |
+     |--(5) Encrypted Data Frames ------------->|
+     |<--(6) Encrypted Response Frames ---------|
+     |                                          |
+
+
+
+
+# Zero Trust Protocol (ZTP)
+
+## Version
+- 1.0 (Initial Draft)
+
+## Overview
+ZTP (Zero Trust Protocol) is a lightweight, encrypted, authenticated, stream-multiplexed protocol designed for secure client-server communication over untrusted networks. It leverages modern cryptography and token-based identity verification.
+
+---
+
+## Frame Format
+Each frame is transmitted over the connection as a sequence of bytes with the following structure:
+
+| Field       | Size (bytes) | Description                                |
+|:------------|:------------|:-------------------------------------------|
+| Version     | 2            | Protocol version number                   |
+| Type        | 2            | Frame type (handshake, data, etc.)         |
+| StreamID    | 4            | Logical stream identifier                 |
+| Nonce       | 12           | Unique nonce for encryption               |
+| Length      | 4            | Length of the encrypted payload           |
+| Payload     | Variable     | Encrypted application or control data     |
+
+**Total Header Size:** 24 bytes.
+
+---
+
+## Message Types
+- **0x01 - TypeHandshakeInit**: Client sends encrypted token after handshake.
+- **0x02 - TypeHandshakeAck**: (Optional) Server acknowledgment.
+- **0x03 - TypeData**: Regular encrypted application or control message.
+- **0x04 - TypeClose**: Closing connection or stream.
+
+---
+
+## Handshake Flow
+
+1. **Key Exchange**:
+   - Client and Server exchange Curve25519 public keys.
+   - Each derives a shared secret.
+
+2. **Session Key Derivation**:
+   - Shared secret passed through SHA-256 to derive the session encryption key.
+
+3. **Token Transmission**:
+   - Client encrypts a signed identity token (HMAC-SHA256) using the session key.
+   - Token includes:
+     - ClientID
+     - Role
+     - Expiration Time
+
+4. **Token Verification**:
+   - Server decrypts and verifies token signature and expiration.
+   - Server enforces access based on declared role.
+
+5. **Secure Session Established**.
+
+---
+
+## Stream Multiplexing
+- Multiple logical streams can exist simultaneously over one TCP connection.
+- Stream IDs must be positive integers.
+- Example assignments:
+  - Stream ID `1` -> Chat messages.
+  - Stream ID `2` -> Control commands (ping, status, etc.).
+
+---
+
+## Encryption Details
+- **Cipher**: ChaCha20-Poly1305 (AEAD)
+- **Nonce Size**: 12 bytes (unique per message)
+- **Key Size**: 32 bytes (derived session key)
+- **Payload Integrity**: Verified by Poly1305 tag
+
+---
+
+## Security Guarantees
+- Confidentiality: All payloads are encrypted.
+- Integrity: AEAD ensures tamper detection.
+- Authentication: Clients authenticate via signed tokens.
+- Authorization: Enforced by role-based token verification.
+- Replay Protection (Coming Soon): Unique nonces per message prevent replays.
+
+---
+
+## Future Extensions
+- Session Resumption
+- Heartbeat Frames
+- Stream Priority
+- Compression
+- Advanced Replay Protection (Anti-Replay Window)
+
+---
+
+# End of Spec
+---
+
+✨ Drafted April 2025 - ZTP Core Team
+
+
+
+📋 ZTP Protocol (Current State)
+
+Step	Client	Server	Description
+1	Generate ECDH key pair	Generate ECDH key pair	🔐
+2	Send public key	Receive public key	🔐
+3	Receive public key	Send public key	🔐
+4	Derive shared session key	Derive shared session key	🔐
+5	Send encrypted identity token (with clientID + role)	Verify token, authenticate role	🔑
+6	Start sending frames on streams	Dispatch frames to correct handler	🚀
+7	Each frame carries: StreamID + Encrypted Payload + Nonce	Each stream has a handler and timeout	🛤️
+8	Server responds back encrypted per stream	Client reads replies	🔁
+9	Streams auto-close if inactive for 30 sec	Cleanup done safely	🧹
+💬 Streams Behavior
+
+StreamID	Purpose	Example Commands
+1	Chat Stream	hello, any normal text
+2	Control Stream	ping, status, time, echo
+✅ What this gave us
+True multi-stream communication over one TCP session.
+
+Role-based authorization at session start.
+
+End-to-end encryption on every frame.
+
+Automatic stream management with timeouts.
+
+Super modular, extensible design.
+
