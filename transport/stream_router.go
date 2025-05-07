@@ -19,25 +19,123 @@ const (
 	PriorityChat    = 5
 )
 
-type StreamRouter struct {
-	streams    map[uint32]chan *protocol.Frame
-	timers     map[uint32]*time.Timer
-	priorities map[uint32]int
+type RateLimiter struct {
+	rate       int
+	burst      int
+	tokens     int
+	lastRefill time.Time
+	lock       sync.Mutex
+}
 
-	lock          sync.RWMutex
+type StreamMetrics struct {
+	Messages     int
+	BytesIn      int
+	BytesOut     int
+	DecryptFails int
+}
+
+func NewRateLimiter(rate int, burst int) *RateLimiter {
+	return &RateLimiter{
+		rate:       rate,
+		burst:      burst,
+		tokens:     burst,
+		lastRefill: time.Now(),
+	}
+}
+
+func (rl *RateLimiter) Allow() bool {
+	rl.lock.Lock()
+	defer rl.lock.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(rl.lastRefill).Seconds()
+	newTokens := int(elapsed * float64(rl.rate))
+
+	if newTokens > 0 {
+		rl.tokens = min(rl.tokens+newTokens, rl.burst)
+		rl.lastRefill = now
+	}
+
+	if rl.tokens > 0 {
+		rl.tokens--
+		return true
+	}
+	return false
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+type StreamRouter struct {
+	timers        map[uint32]*time.Timer
+	priorities    map[uint32]int
+	rateLimits    map[uint32]*RateLimiter
 	sessionKey    [32]byte
 	writer        *bufio.Writer
 	uploadManager *UploadManager
+	usedNonces    map[string]struct{}
+	metrics       map[uint32]*StreamMetrics
+	lock          sync.RWMutex
 }
 
 func NewStreamRouter(sessionKey [32]byte, writer *bufio.Writer) *StreamRouter {
-	return &StreamRouter{
-		streams:       make(map[uint32]chan *protocol.Frame),
+	sr := &StreamRouter{
 		timers:        make(map[uint32]*time.Timer),
 		priorities:    make(map[uint32]int),
+		rateLimits:    make(map[uint32]*RateLimiter),
 		sessionKey:    sessionKey,
 		writer:        writer,
 		uploadManager: NewUploadManager(),
+		usedNonces:    make(map[string]struct{}),
+		metrics:       make(map[uint32]*StreamMetrics),
+	}
+
+	return sr
+}
+
+func (sr *StreamRouter) handleFrameDispatch(streamID uint32, frame *protocol.Frame) {
+	sr.lock.RLock()
+	priority, hasPriority := sr.priorities[streamID]
+	sr.lock.RUnlock()
+
+	if !hasPriority {
+		log.Printf("[Router] Unknown stream %d: priority not set", streamID)
+		return
+	}
+
+	plaintext, err := crypto.Decrypt(sr.sessionKey, frame.Nonce, frame.Payload, nil)
+	if err != nil {
+		log.Printf("[Router] Stream %d decryption failed: %v", streamID, err)
+		if m, ok := sr.metrics[streamID]; ok {
+			m.DecryptFails++
+		}
+		return
+	}
+	message := string(plaintext)
+
+	if sr.uploadManager.IsUploading(streamID) {
+		if sr.uploadManager.HandleChunk(streamID, plaintext) {
+			sr.sendResponse(streamID, "Upload complete")
+			sr.CloseStream(streamID) // ✅ graceful close
+		}
+		return
+	}
+
+	switch priority {
+	case PriorityControl:
+		if strings.HasPrefix(message, "upload ") {
+			sr.startUpload(streamID, message)
+		} else if strings.HasPrefix(message, "download ") {
+			sr.startDownload(streamID, message)
+		} else {
+			sr.handleControlCommand(streamID, message)
+		}
+	default:
+		sr.handleChatMessage(streamID, message)
 	}
 }
 
@@ -45,65 +143,43 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 	sr.lock.Lock()
 	defer sr.lock.Unlock()
 
-	ch, exists := sr.streams[frame.StreamID]
-	if !exists {
-		ch = make(chan *protocol.Frame, 10)
-		sr.streams[frame.StreamID] = ch
-		sr.timers[frame.StreamID] = sr.startTimer(frame.StreamID)
-		if frame.StreamID == 2 {
-			sr.priorities[frame.StreamID] = PriorityControl
-		} else {
-			sr.priorities[frame.StreamID] = PriorityChat
-		}
-		go sr.handleStream(frame.StreamID, ch)
+	nonceKey := string(frame.Nonce[:])
+	if _, used := sr.usedNonces[nonceKey]; used {
+		log.Printf("[Router] Replay detected for nonce %x, stream %d", frame.Nonce, frame.StreamID)
+		return
 	}
-	ch <- frame
-}
+	sr.usedNonces[nonceKey] = struct{}{}
 
-func (sr *StreamRouter) startTimer(streamID uint32) *time.Timer {
-	return time.AfterFunc(30*time.Second, func() {
-		log.Printf("[Router] Stream %d timed out", streamID)
-		sr.CloseStream(streamID)
-	})
-}
-
-func (sr *StreamRouter) resetTimer(streamID uint32) {
-	if timer, ok := sr.timers[streamID]; ok {
-		timer.Reset(30 * time.Second)
+	if !sr.allowFrame(frame.StreamID) {
+		log.Printf("[RateLimit] Stream %d exceeded rate limit, dropping frame", frame.StreamID)
+		return
 	}
-}
 
-func (sr *StreamRouter) handleStream(streamID uint32, ch chan *protocol.Frame) {
-	log.Printf("[Router] New handler for Stream %d", streamID)
-	defer log.Printf("[Router] Handler closed for Stream %d", streamID)
+	if _, ok := sr.metrics[frame.StreamID]; !ok {
+		sr.metrics[frame.StreamID] = &StreamMetrics{}
+	}
+	sr.metrics[frame.StreamID].Messages++
+	sr.metrics[frame.StreamID].BytesIn += len(frame.Payload)
 
-	for frame := range ch {
-		plaintext, err := crypto.Decrypt(sr.sessionKey, frame.Nonce, frame.Payload, nil)
+	if _, ok := sr.priorities[frame.StreamID]; !ok {
+		// Guess priority by command type (peek into payload)
+		plain, err := crypto.Decrypt(sr.sessionKey, frame.Nonce, frame.Payload, nil)
 		if err != nil {
-			log.Printf("[Router] Stream %d decryption failed: %v", streamID, err)
-			continue
-		}
-		message := string(plaintext)
-
-		if sr.uploadManager.IsUploading(streamID) {
-			if sr.uploadManager.HandleChunk(streamID, plaintext) {
-				sr.sendResponse(streamID, "Upload complete")
-			}
-			continue
-		}
-
-		if sr.priorities[streamID] == PriorityControl {
-			if strings.HasPrefix(message, "upload ") {
-				sr.startUpload(streamID, message)
-			} else if strings.HasPrefix(message, "download ") {
-				sr.startDownload(streamID, message)
-			} else {
-				sr.handleControlCommand(streamID, message)
-			}
+			sr.priorities[frame.StreamID] = PriorityChat
 		} else {
-			sr.handleChatMessage(streamID, message)
+			cmd := strings.ToLower(string(plain))
+			if strings.HasPrefix(cmd, "ping") || strings.HasPrefix(cmd, "upload") || strings.HasPrefix(cmd, "download") || strings.HasPrefix(cmd, "status") {
+				sr.priorities[frame.StreamID] = PriorityControl
+			} else {
+				sr.priorities[frame.StreamID] = PriorityChat
+			}
 		}
+		sr.timers[frame.StreamID] = sr.startTimer(frame.StreamID)
+		sr.rateLimits[frame.StreamID] = NewRateLimiter(10, 20)
 	}
+
+	// Handle frame directly instead of channel
+	go sr.handleFrameDispatch(frame.StreamID, frame)
 }
 
 func (sr *StreamRouter) startUpload(streamID uint32, command string) {
@@ -113,13 +189,13 @@ func (sr *StreamRouter) startUpload(streamID uint32, command string) {
 		return
 	}
 	filename := parts[1]
-	err := sr.uploadManager.StartUpload(streamID, filename)
+	offset, err := sr.uploadManager.StartUpload(streamID, filename)
 	if err != nil {
 		sr.sendResponse(streamID, fmt.Sprintf("Failed to start upload: %v", err))
 		return
 	}
-	log.Printf("[Router] Stream %d ready to receive file: %s", streamID, filename)
-	sr.sendResponse(streamID, "Ready to receive file")
+	log.Printf("[Router] Stream %d ready to receive file: %s at offset %d", streamID, filename, offset)
+	sr.sendResponse(streamID, fmt.Sprintf("Ready to receive file at offset %d", offset))
 }
 
 func (sr *StreamRouter) startDownload(streamID uint32, command string) {
@@ -129,17 +205,16 @@ func (sr *StreamRouter) startDownload(streamID uint32, command string) {
 		return
 	}
 	filename := parts[1]
-
-	f, err := os.Open("server_files/" + filename)
+	file, err := os.Open("server_files/" + filename)
 	if err != nil {
 		sr.sendResponse(streamID, fmt.Sprintf("Failed to open file: %v", err))
 		return
 	}
-	defer f.Close()
+	defer file.Close()
 
 	buffer := make([]byte, 1024)
 	for {
-		n, err := f.Read(buffer)
+		n, err := file.Read(buffer)
 		if err != nil && err != io.EOF {
 			sr.sendResponse(streamID, "Error reading file")
 			return
@@ -149,8 +224,10 @@ func (sr *StreamRouter) startDownload(streamID uint32, command string) {
 		}
 		sr.sendResponse(streamID, string(buffer[:n]))
 	}
+
 	sr.sendResponse(streamID, protocol.UploadEndMarker)
 	log.Printf("[Router] Finished sending file %s to Stream %d", filename, streamID)
+	sr.CloseStream(streamID) // ✅ graceful close after sending EOF
 }
 
 func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
@@ -181,7 +258,6 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 	default:
 		response = "Unknown command"
 	}
-
 	log.Printf("[Router] Stream %d: Control -> %s", streamID, command)
 	sr.sendResponse(streamID, response)
 }
@@ -189,6 +265,63 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 func (sr *StreamRouter) handleChatMessage(streamID uint32, message string) {
 	log.Printf("[Router] Stream %d: Chat -> %s", streamID, message)
 	sr.sendResponse(streamID, message)
+}
+
+func (sr *StreamRouter) allowFrame(streamID uint32) bool {
+	rl, ok := sr.rateLimits[streamID]
+	if !ok {
+		return true
+	}
+	return rl.Allow()
+}
+
+func (sr *StreamRouter) startTimer(streamID uint32) *time.Timer {
+	return time.AfterFunc(30*time.Second, func() {
+		log.Printf("[Router] Stream %d timed out", streamID)
+		sr.CloseStream(streamID)
+	})
+}
+
+func (sr *StreamRouter) resetTimer(streamID uint32) {
+	if timer, ok := sr.timers[streamID]; ok {
+		timer.Reset(30 * time.Second)
+	}
+}
+
+func (sr *StreamRouter) handleStream(streamID uint32, ch chan *protocol.Frame) {
+	log.Printf("[Router] New handler for Stream %d", streamID)
+	defer log.Printf("[Router] Handler closed for Stream %d", streamID)
+
+	for frame := range ch {
+		plaintext, err := crypto.Decrypt(sr.sessionKey, frame.Nonce, frame.Payload, nil)
+		if err != nil {
+			log.Printf("[Router] Stream %d decryption failed: %v", streamID, err)
+			if m, ok := sr.metrics[streamID]; ok {
+				m.DecryptFails++
+			}
+			continue
+		}
+		message := string(plaintext)
+
+		if sr.uploadManager.IsUploading(streamID) {
+			if sr.uploadManager.HandleChunk(streamID, plaintext) {
+				sr.sendResponse(streamID, "Upload complete")
+			}
+			continue
+		}
+
+		if sr.priorities[streamID] == PriorityControl {
+			if strings.HasPrefix(message, "upload ") {
+				sr.startUpload(streamID, message)
+			} else if strings.HasPrefix(message, "download ") {
+				sr.startDownload(streamID, message)
+			} else {
+				sr.handleControlCommand(streamID, message)
+			}
+		} else {
+			sr.handleChatMessage(streamID, message)
+		}
+	}
 }
 
 func (sr *StreamRouter) sendResponse(streamID uint32, message string) {
@@ -217,6 +350,11 @@ func (sr *StreamRouter) sendResponse(streamID uint32, message string) {
 		return
 	}
 	sr.writer.Flush()
+
+	if m, ok := sr.metrics[streamID]; ok {
+		m.BytesOut += len(encoded)
+	}
+
 	log.Printf("[Router] Response sent to Stream %d", streamID)
 }
 
@@ -224,30 +362,31 @@ func (sr *StreamRouter) CloseStream(streamID uint32) {
 	sr.lock.Lock()
 	defer sr.lock.Unlock()
 
-	if ch, ok := sr.streams[streamID]; ok {
-		close(ch)
-		delete(sr.streams, streamID)
-	}
 	if timer, ok := sr.timers[streamID]; ok {
 		timer.Stop()
 		delete(sr.timers, streamID)
 	}
 	delete(sr.priorities, streamID)
 	sr.uploadManager.AbortUpload(streamID)
+
+	// Print metrics summary
+	if m, ok := sr.metrics[streamID]; ok {
+		log.Printf("[Metrics] Stream %d: %d msgs | %dB in | %dB out | %d decrypt fails",
+			streamID, m.Messages, m.BytesIn, m.BytesOut, m.DecryptFails)
+		delete(sr.metrics, streamID)
+	}
 }
 
 func (sr *StreamRouter) CloseAll() {
 	sr.lock.Lock()
 	defer sr.lock.Unlock()
 
-	for id, ch := range sr.streams {
-		close(ch)
-		delete(sr.streams, id)
-	}
 	for id, timer := range sr.timers {
 		timer.Stop()
 		delete(sr.timers, id)
 	}
 	sr.priorities = make(map[uint32]int)
 	sr.uploadManager = NewUploadManager()
+	sr.usedNonces = make(map[string]struct{})
+	sr.metrics = make(map[uint32]*StreamMetrics)
 }

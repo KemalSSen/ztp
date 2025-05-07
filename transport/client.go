@@ -83,7 +83,7 @@ func StartClient(address string) error {
 
 		lower := strings.ToLower(input)
 		if strings.HasPrefix(lower, "upload ") {
-			handleUpload(w, sessionKey, input)
+			handleUpload(r, w, sessionKey, input)
 			continue
 		}
 
@@ -112,21 +112,15 @@ func StartClient(address string) error {
 	return nil
 }
 
-func handleUpload(w *bufio.Writer, sessionKey [32]byte, command string) {
+func handleUpload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, command string) {
 	parts := strings.SplitN(command, " ", 2)
 	if len(parts) != 2 {
 		fmt.Println("[Client] Usage: upload <filename>")
 		return
 	}
 	filename := parts[1]
-	file, err := os.Open(filename)
-	if err != nil {
-		fmt.Printf("[Client] Failed to open file: %v\n", err)
-		return
-	}
-	defer file.Close()
 
-	// Step 1: Notify server
+	// Step 1: Notify server with "upload <filename>"
 	nonce, _ := crypto.GenerateNonce()
 	ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(command), nil)
 	frame, _ := protocol.NewFrameWithStream(2, protocol.TypeData, nonce, ciphertext)
@@ -134,9 +128,33 @@ func handleUpload(w *bufio.Writer, sessionKey [32]byte, command string) {
 	w.Write(frameBytes)
 	w.Flush()
 
-	time.Sleep(300 * time.Millisecond)
+	// Step 2: Await server's "Ready..." message with offset
+	responseFrame, err := protocol.Decode(r)
+	if err != nil {
+		fmt.Printf("[Client] Failed to read server response: %v\n", err)
+		return
+	}
+	response, _ := crypto.Decrypt(sessionKey, responseFrame.Nonce, responseFrame.Payload, nil)
+	responseStr := string(response)
+	fmt.Println("[Server]:", responseStr)
 
-	// Step 2: Send file content
+	// Step 3: Parse offset from server's response
+	var offset int64 = 0
+	fmt.Sscanf(responseStr, "Ready to receive file at offset %d", &offset)
+
+	// Step 4: Start upload from the given offset
+	file, err := os.Open(filename)
+	if err != nil {
+		fmt.Printf("[Client] Failed to open file: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	if offset > 0 {
+		file.Seek(offset, io.SeekStart)
+	}
+
+	// Step 5: Stream file chunks
 	buffer := make([]byte, 1024)
 	for {
 		n, err := file.Read(buffer)
@@ -155,7 +173,7 @@ func handleUpload(w *bufio.Writer, sessionKey [32]byte, command string) {
 		w.Flush()
 	}
 
-	// Step 3: Signal end of file
+	// Step 6: Signal end of upload
 	nonce, _ = crypto.GenerateNonce()
 	ciphertext, _ = crypto.Encrypt(sessionKey, nonce, []byte(protocol.UploadEndMarker), nil)
 	frame, _ = protocol.NewFrameWithStream(2, protocol.TypeData, nonce, ciphertext)
