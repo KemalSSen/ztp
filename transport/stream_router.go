@@ -80,10 +80,12 @@ type StreamRouter struct {
 	usedNonces    map[string]struct{}
 	metrics       map[uint32]*StreamMetrics
 	lock          sync.RWMutex
+	roles         map[uint32]string // add to struct
+	replayBuffer  *ReplayBuffer
 }
 
 func NewStreamRouter(sessionKey [32]byte, writer *bufio.Writer) *StreamRouter {
-	sr := &StreamRouter{
+	return &StreamRouter{
 		timers:        make(map[uint32]*time.Timer),
 		priorities:    make(map[uint32]int),
 		rateLimits:    make(map[uint32]*RateLimiter),
@@ -92,9 +94,10 @@ func NewStreamRouter(sessionKey [32]byte, writer *bufio.Writer) *StreamRouter {
 		uploadManager: NewUploadManager(),
 		usedNonces:    make(map[string]struct{}),
 		metrics:       make(map[uint32]*StreamMetrics),
-	}
+		roles:         make(map[uint32]string), // ✅ this is what you need
+		replayBuffer:  NewReplayBuffer(1000),   // tracks last 1000 nonces
 
-	return sr
+	}
 }
 
 func (sr *StreamRouter) handleFrameDispatch(streamID uint32, frame *protocol.Frame) {
@@ -127,7 +130,7 @@ func (sr *StreamRouter) handleFrameDispatch(streamID uint32, frame *protocol.Fra
 
 	switch priority {
 	case PriorityControl:
-		if strings.HasPrefix(message, "upload ") {
+		if strings.HasPrefix(message, "upload ") || strings.HasPrefix(message, "upload-gzip ") {
 			sr.startUpload(streamID, message)
 		} else if strings.HasPrefix(message, "download ") {
 			sr.startDownload(streamID, message)
@@ -144,7 +147,7 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 	defer sr.lock.Unlock()
 
 	nonceKey := string(frame.Nonce[:])
-	if _, used := sr.usedNonces[nonceKey]; used {
+	if sr.replayBuffer.Seen(nonceKey) {
 		log.Printf("[Router] Replay detected for nonce %x, stream %d", frame.Nonce, frame.StreamID)
 		return
 	}
@@ -168,7 +171,11 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 			sr.priorities[frame.StreamID] = PriorityChat
 		} else {
 			cmd := strings.ToLower(string(plain))
-			if strings.HasPrefix(cmd, "ping") || strings.HasPrefix(cmd, "upload") || strings.HasPrefix(cmd, "download") || strings.HasPrefix(cmd, "status") {
+			if strings.HasPrefix(cmd, "ping") ||
+				strings.HasPrefix(cmd, "upload") ||
+				strings.HasPrefix(cmd, "download") ||
+				strings.HasPrefix(cmd, "status") ||
+				strings.HasPrefix(cmd, "resume") { // ✅ Add this
 				sr.priorities[frame.StreamID] = PriorityControl
 			} else {
 				sr.priorities[frame.StreamID] = PriorityChat
@@ -178,7 +185,6 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 		sr.rateLimits[frame.StreamID] = NewRateLimiter(10, 20)
 	}
 
-	// Handle frame directly instead of channel
 	go sr.handleFrameDispatch(frame.StreamID, frame)
 }
 
@@ -188,12 +194,29 @@ func (sr *StreamRouter) startUpload(streamID uint32, command string) {
 		sr.sendResponse(streamID, "Invalid upload command")
 		return
 	}
-	filename := parts[1]
+
+	raw := parts[1]
+	isGzipped := false
+
+	if strings.HasPrefix(raw, "gzip ") {
+		isGzipped = true
+		raw = strings.TrimPrefix(raw, "gzip ")
+	}
+
+	filename := raw
 	offset, err := sr.uploadManager.StartUpload(streamID, filename)
 	if err != nil {
 		sr.sendResponse(streamID, fmt.Sprintf("Failed to start upload: %v", err))
 		return
 	}
+
+	// Mark stream as gzipped if needed
+	sr.uploadManager.lock.Lock()
+	if state, ok := sr.uploadManager.activeUploads[streamID]; ok {
+		state.IsGzipped = isGzipped
+	}
+	sr.uploadManager.lock.Unlock()
+
 	log.Printf("[Router] Stream %d ready to receive file: %s at offset %d", streamID, filename, offset)
 	sr.sendResponse(streamID, fmt.Sprintf("Ready to receive file at offset %d", offset))
 }
@@ -246,7 +269,23 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 	case "time":
 		response = time.Now().UTC().Format(time.RFC3339)
 	case "list":
-		response = "Available: file1.txt, file2.txt, config.yaml"
+		files, err := os.ReadDir("server_files")
+		if err != nil {
+			response = "Failed to list files"
+		} else {
+			names := make([]string, 0)
+			for _, f := range files {
+				if !f.IsDir() {
+					names = append(names, f.Name())
+				}
+			}
+			if len(names) == 0 {
+				response = "No files available"
+			} else {
+				response = "Files: " + strings.Join(names, ", ")
+			}
+		}
+
 	case "info":
 		response = "ZTP Server v1.0 - Secure Transport Protocol"
 	case "echo":
@@ -255,6 +294,21 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 		} else {
 			response = "No message to echo"
 		}
+	case "resume":
+		if len(cmdParts) != 2 {
+			response = "Usage: resume <client_id>"
+			break
+		}
+		clientID := cmdParts[1]
+		sess, ok := sessions.Load(clientID)
+		if !ok {
+			response = "No valid session found for " + clientID
+			break
+		}
+		sr.sessionKey = sess.Key
+		sr.roles[streamID] = sess.Role
+		response = "Session resumed for " + clientID
+
 	default:
 		response = "Unknown command"
 	}
@@ -277,9 +331,11 @@ func (sr *StreamRouter) allowFrame(streamID uint32) bool {
 
 func (sr *StreamRouter) startTimer(streamID uint32) *time.Timer {
 	return time.AfterFunc(30*time.Second, func() {
+
 		log.Printf("[Router] Stream %d timed out", streamID)
 		sr.CloseStream(streamID)
 	})
+
 }
 
 func (sr *StreamRouter) resetTimer(streamID uint32) {
@@ -375,6 +431,8 @@ func (sr *StreamRouter) CloseStream(streamID uint32) {
 			streamID, m.Messages, m.BytesIn, m.BytesOut, m.DecryptFails)
 		delete(sr.metrics, streamID)
 	}
+	log.Printf("[Router] Closing stream %d", streamID)
+
 }
 
 func (sr *StreamRouter) CloseAll() {

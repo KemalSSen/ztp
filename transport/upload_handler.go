@@ -1,19 +1,23 @@
 package transport
 
 import (
+	"compress/gzip"
 	"fmt"
+	"io"
+	"log"
 	"os"
+	"strings"
 	"sync"
 	"ztp/protocol"
 )
 
-// UploadState tracks partial upload information
 type UploadState struct {
-	File   *os.File
-	Offset int64
+	File      *os.File
+	Offset    int64
+	IsGzipped bool
+	pipeW     *io.PipeWriter
 }
 
-// UploadManager handles resumable uploads by stream
 type UploadManager struct {
 	activeUploads map[uint32]*UploadState
 	lock          sync.RWMutex
@@ -25,7 +29,6 @@ func NewUploadManager() *UploadManager {
 	}
 }
 
-// StartUpload prepares to write to a file (appends if exists)
 func (um *UploadManager) StartUpload(streamID uint32, filename string) (int64, error) {
 	um.lock.Lock()
 	defer um.lock.Unlock()
@@ -34,7 +37,12 @@ func (um *UploadManager) StartUpload(streamID uint32, filename string) (int64, e
 		return 0, fmt.Errorf("upload already active on stream %d", streamID)
 	}
 
-	// Ensure server_files directory exists
+	isGzipped := false
+	if strings.HasPrefix(filename, "gzip ") {
+		isGzipped = true
+		filename = strings.TrimPrefix(filename, "gzip ")
+	}
+
 	if _, err := os.Stat("server_files"); os.IsNotExist(err) {
 		if err := os.MkdirAll("server_files", 0755); err != nil {
 			return 0, fmt.Errorf("failed to create server_files directory: %v", err)
@@ -43,7 +51,7 @@ func (um *UploadManager) StartUpload(streamID uint32, filename string) (int64, e
 
 	fullPath := "server_files/" + filename
 	var file *os.File
-	var offset int64 = 0
+	var offset int64
 
 	if stat, err := os.Stat(fullPath); err == nil {
 		file, err = os.OpenFile(fullPath, os.O_APPEND|os.O_WRONLY, 0644)
@@ -58,10 +66,27 @@ func (um *UploadManager) StartUpload(streamID uint32, filename string) (int64, e
 		}
 	}
 
-	um.activeUploads[streamID] = &UploadState{
-		File:   file,
-		Offset: offset,
+	state := &UploadState{
+		File:      file,
+		Offset:    offset,
+		IsGzipped: isGzipped,
 	}
+
+	if isGzipped {
+		pr, pw := io.Pipe()
+		state.pipeW = pw
+		gr, err := gzip.NewReader(pr)
+		if err != nil {
+			return 0, fmt.Errorf("gzip reader setup failed: %v", err)
+		}
+		go func() {
+			defer gr.Close()
+			io.Copy(file, gr)
+		}()
+	}
+
+	um.activeUploads[streamID] = state
+	log.Printf("[UploadManager] Stream %d: %s opened at offset %d", streamID, filename, offset)
 	return offset, nil
 }
 
@@ -77,17 +102,28 @@ func (um *UploadManager) HandleChunk(streamID uint32, chunk []byte) bool {
 	if string(chunk) == protocol.UploadEndMarker {
 		um.lock.Lock()
 		defer um.lock.Unlock()
+		if state.IsGzipped && state.pipeW != nil {
+			state.pipeW.Close()
+		}
 		state.File.Close()
 		delete(um.activeUploads, streamID)
 		return true
 	}
 
-	n, err := state.File.Write(chunk)
-	if err != nil {
-		fmt.Printf("[UploadManager] Failed to write chunk: %v\n", err)
-		return false
+	if state.IsGzipped && state.pipeW != nil {
+		if _, err := state.pipeW.Write(chunk); err != nil {
+			log.Printf("[UploadManager] Failed to write gzip chunk: %v", err)
+			return false
+		}
+	} else {
+		n, err := state.File.Write(chunk)
+		if err != nil {
+			log.Printf("[UploadManager] Failed to write chunk: %v", err)
+			return false
+		}
+		state.Offset += int64(n)
 	}
-	state.Offset += int64(n)
+
 	return false
 }
 
@@ -103,6 +139,9 @@ func (um *UploadManager) AbortUpload(streamID uint32) {
 	defer um.lock.Unlock()
 
 	if state, ok := um.activeUploads[streamID]; ok {
+		if state.pipeW != nil {
+			state.pipeW.Close()
+		}
 		state.File.Close()
 		delete(um.activeUploads, streamID)
 	}

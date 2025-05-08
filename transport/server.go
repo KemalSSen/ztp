@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"ztp/crypto"
 	"ztp/identity"
@@ -17,6 +18,9 @@ var allowedRoles = map[string]bool{
 	"admin": true,
 	"user":  true,
 }
+
+// Global session store
+var sessions = NewSessionManager()
 
 // StartServer launches the ZTP server
 func StartServer(address string) error {
@@ -101,8 +105,16 @@ func handleConnection(conn net.Conn) {
 	log.Printf("[ZTP] Authenticated client: %s with role: %s", claims.ClientID, claims.Role)
 	log.Println("[ZTP] Handshake complete. Secure session established.")
 
+	// Save session for resume
+	sessions.Save(claims.ClientID, Session{
+		Key:      sessionKey,
+		Role:     claims.Role,
+		LastSeen: time.Now(),
+	})
+
 	// --- Phase 3: Stream Routing ---
 	router := NewStreamRouter(sessionKey, w)
+	router.roles[1] = claims.Role // attach role to control stream
 
 	for {
 		frame, err := protocol.Decode(r)

@@ -16,9 +16,14 @@ import (
 
 func main() {
 	addr := flag.String("addr", "localhost:9999", "Address of the ZTP server")
+
 	flag.Parse()
 
 	if flag.NArg() < 1 {
+		if err := transport.StartClient(*addr); err != nil {
+			log.Fatalf("[ztp-client] Error: %v", err)
+		}
+
 		fmt.Println("Usage:")
 		fmt.Println("  ztp-client --addr <host:port> <command> [args...]")
 		fmt.Println("Examples:")

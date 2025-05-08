@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bufio"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"log"
@@ -113,14 +114,24 @@ func StartClient(address string) error {
 }
 
 func handleUpload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, command string) {
-	parts := strings.SplitN(command, " ", 2)
-	if len(parts) != 2 {
-		fmt.Println("[Client] Usage: upload <filename>")
-		return
-	}
-	filename := parts[1]
+	useGzip := false
+	var filename string
 
-	// Step 1: Notify server with "upload <filename>"
+	if strings.HasPrefix(command, "upload --gzip ") {
+		useGzip = true
+		realFile := strings.TrimPrefix(command, "upload --gzip ")
+		command = "upload-gzip " + realFile
+		filename = realFile
+	} else {
+		parts := strings.SplitN(command, " ", 2)
+		if len(parts) != 2 {
+			fmt.Println("[Client] Usage: upload <filename>")
+			return
+		}
+		filename = parts[1]
+	}
+
+	// Step 1: Send command to server
 	nonce, _ := crypto.GenerateNonce()
 	ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(command), nil)
 	frame, _ := protocol.NewFrameWithStream(2, protocol.TypeData, nonce, ciphertext)
@@ -128,7 +139,7 @@ func handleUpload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, command
 	w.Write(frameBytes)
 	w.Flush()
 
-	// Step 2: Await server's "Ready..." message with offset
+	// Step 2: Await server response
 	responseFrame, err := protocol.Decode(r)
 	if err != nil {
 		fmt.Printf("[Client] Failed to read server response: %v\n", err)
@@ -138,11 +149,10 @@ func handleUpload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, command
 	responseStr := string(response)
 	fmt.Println("[Server]:", responseStr)
 
-	// Step 3: Parse offset from server's response
 	var offset int64 = 0
 	fmt.Sscanf(responseStr, "Ready to receive file at offset %d", &offset)
 
-	// Step 4: Start upload from the given offset
+	// Step 3: Open file
 	file, err := os.Open(filename)
 	if err != nil {
 		fmt.Printf("[Client] Failed to open file: %v\n", err)
@@ -154,10 +164,26 @@ func handleUpload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, command
 		file.Seek(offset, io.SeekStart)
 	}
 
-	// Step 5: Stream file chunks
+	// Step 4: Optional compression
+	var reader io.Reader = file
+	if useGzip {
+		pr, pw := io.Pipe()
+		go func() {
+			gw := gzip.NewWriter(pw)
+			_, err := io.Copy(gw, file)
+			gw.Close()
+			pw.Close()
+			if err != nil {
+				log.Printf("[Client] GZIP compression error: %v", err)
+			}
+		}()
+		reader = pr
+	}
+
+	// Step 5: Stream data
 	buffer := make([]byte, 1024)
 	for {
-		n, err := file.Read(buffer)
+		n, err := reader.Read(buffer)
 		if err != nil && err != io.EOF {
 			fmt.Printf("[Client] Failed to read file: %v\n", err)
 			return
@@ -173,7 +199,7 @@ func handleUpload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, command
 		w.Flush()
 	}
 
-	// Step 6: Signal end of upload
+	// Step 6: EOF signal
 	nonce, _ = crypto.GenerateNonce()
 	ciphertext, _ = crypto.Encrypt(sessionKey, nonce, []byte(protocol.UploadEndMarker), nil)
 	frame, _ = protocol.NewFrameWithStream(2, protocol.TypeData, nonce, ciphertext)
