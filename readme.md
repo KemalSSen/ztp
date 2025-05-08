@@ -1,208 +1,207 @@
 # Zero Trust Protocol (ZTP)
 
-## Version
-- 1.0 (Initial Draft)
-
 ## Overview
-ZTP (Zero Trust Protocol) is a lightweight, encrypted, authenticated, stream-multiplexed protocol designed for secure client-server communication over untrusted networks. It leverages modern cryptography and token-based identity verification.
+
+ZTP (Zero Trust Protocol) is a secure, encrypted, and authenticated transport protocol designed to operate over untrusted networks. It uses modern cryptographic primitives, a stream-multiplexed architecture, and token-based identity verification to ensure confidentiality, integrity, and access control.
 
 ---
 
-## Frame Format
-Each frame is transmitted over the connection as a sequence of bytes with the following structure:
+## ✨ Key Features
 
-| Field       | Size (bytes) | Description                                |
-|:------------|:------------|:-------------------------------------------|
-| Version     | 2            | Protocol version number                   |
-| Type        | 2            | Frame type (handshake, data, etc.)         |
-| StreamID    | 4            | Logical stream identifier                 |
-| Nonce       | 12           | Unique nonce for encryption               |
-| Length      | 4            | Length of the encrypted payload           |
-| Payload     | Variable     | Encrypted application or control data     |
+### 🔐 Security
 
-**Total Header Size:** 24 bytes.
+* **Encryption**: End-to-end encryption using ChaCha20-Poly1305 AEAD.
+* **Authentication**: Client identity verified using signed HMAC-SHA256 tokens.
+* **Replay Protection**: Each message includes a unique nonce.
+* **Tamper Detection**: Poly1305 ensures integrity and authenticity.
 
----
+### 🧩 Modular Design
 
-## Message Types
-- **0x01 - TypeHandshakeInit**: Client sends encrypted token after handshake.
-- **0x02 - TypeHandshakeAck**: (Optional) Server acknowledgment.
-- **0x03 - TypeData**: Regular encrypted application or control message.
-- **0x04 - TypeClose**: Closing connection or stream.
+* Supports multiple **logical streams** over a single TCP connection.
+* Control and application traffic separated via **stream IDs**.
+* Upload/download with resumable support via server-managed offsets.
 
----
+### 🛠️ Developer Friendly
 
-## Handshake Flow
+* Easy-to-use CLI and client library.
+* Fully extendable and modular backend.
+* Detailed debug and logging output.
 
-1. **Key Exchange**:
-   - Client and Server exchange Curve25519 public keys.
-   - Each derives a shared secret.
+### 📈 Metrics & Observability
 
-2. **Session Key Derivation**:
-   - Shared secret passed through SHA-256 to derive the session encryption key.
-
-3. **Token Transmission**:
-   - Client encrypts a signed identity token (HMAC-SHA256) using the session key.
-   - Token includes:
-     - ClientID
-     - Role
-     - Expiration Time
-
-4. **Token Verification**:
-   - Server decrypts and verifies token signature and expiration.
-   - Server enforces access based on declared role.
-
-5. **Secure Session Established**.
+* Tracks per-stream: message count, inbound/outbound bytes, decrypt failures.
+* Cleaned up on stream close or timeout.
 
 ---
 
-## Stream Multiplexing
-- Multiple logical streams can exist simultaneously over one TCP connection.
-- Stream IDs must be positive integers.
-- Example assignments:
-  - Stream ID `1` -> Chat messages.
-  - Stream ID `2` -> Control commands (ping, status, etc.).
+## 🧪 Current Functionality
+
+### ✅ Secure Handshake
+
+1. ECDH Key Exchange (Curve25519)
+2. Derive 32-byte session key via SHA-256
+3. Encrypted identity token from client to server
+4. Role verification and session start
+
+### ✅ Frame Format
+
+| Field    | Size (bytes) | Description              |
+| -------- | ------------ | ------------------------ |
+| Version  | 2            | Protocol version         |
+| Type     | 2            | Frame type               |
+| StreamID | 4            | Logical stream ID        |
+| Nonce    | 12           | Encryption nonce         |
+| Length   | 4            | Encrypted payload length |
+| Payload  | Variable     | AEAD-encrypted data      |
+
+### ✅ Message Types
+
+* `0x01` - HandshakeInit
+* `0x02` - HandshakeAck (planned)
+* `0x03` - Encrypted Data
+* `0x04` - Stream/Connection Close
+
+### ✅ Streams
+
+* `1` - Chat messages
+* `2` - Control commands (e.g. ping, time, echo)
+* `N` - Arbitrary, per-client streams (file transfers, uploads, etc.)
+
+### ✅ Supported Commands
+
+| Command    | Description                     |
+| ---------- | ------------------------------- |
+| `ping`     | Server replies with `pong`      |
+| `status`   | Shows server status             |
+| `time`     | Returns current UTC time        |
+| `info`     | Returns server description      |
+| `echo`     | Echoes back the user message    |
+| `list`     | Lists available files           |
+| `upload`   | Upload a file to the server     |
+| `download` | Download a file from the server |
+
+### ✅ Uploads
+
+* Streamed over Stream ID `2`
+* Server saves to `server_files/<filename>`
+* Supports resumable uploads via file offset
+
+### ✅ Downloads
+
+* Server reads file and streams back in 1024B chunks
+* Ends with `[EOF]` marker
+* Saved as `downloaded_<filename>` on client
+
+### ✅ CLI Client
+
+Usage:
+
+```bash
+ztp-client --addr <host:port> <command> [args]
+```
+
+Examples:
+
+```bash
+ztp-client --addr localhost:9999 ping
+ztp-client --addr localhost:9999 upload notes.txt
+ztp-client --addr localhost:9999 download notes.txt
+ztp-client --addr localhost:9999 chat "hello world"
+```
 
 ---
 
-## Encryption Details
-- **Cipher**: ChaCha20-Poly1305 (AEAD)
-- **Nonce Size**: 12 bytes (unique per message)
-- **Key Size**: 32 bytes (derived session key)
-- **Payload Integrity**: Verified by Poly1305 tag
+## 📁 Project Structure
 
----
-
-## Security Guarantees
-- Confidentiality: All payloads are encrypted.
-- Integrity: AEAD ensures tamper detection.
-- Authentication: Clients authenticate via signed tokens.
-- Authorization: Enforced by role-based token verification.
-- Replay Protection (Coming Soon): Unique nonces per message prevent replays.
-
----
-
-## Future Extensions
-- Session Resumption
-- Heartbeat Frames
-- Stream Priority
-- Compression
-- Advanced Replay Protection (Anti-Replay Window)
-
----
-
-# End of Spec
----
-
-✨ Drafted April 2025 - ZTP Core Team
-
-**************************************************************New************************************************************************
-
-
-
-Zero Trust Protocol (ZTP) 🚀
-A lightweight, encrypted, authenticated, stream-multiplexed secure protocol written in Go.
-
-✨ Features
-🔒 End-to-end encryption using Curve25519 (key exchange) and ChaCha20-Poly1305 (message encryption).
-
-🧩 Multiple logical streams over a single TCP connection (Control and Chat streams).
-
-🔐 Identity verification with signed tokens (JWT-based).
-
-📂 Secure file upload and download support.
-
-📡 Idle stream timeout and automatic cleanup.
-
-🛡️ Minimal, battle-ready, Zero Trust design principles.
-
-🧹 Full logging and graceful error handling.
-
-📁 Project Structure
-bash
-Copy
-Edit
+```
 ztp/
-├── cmd/
-│   ├── client/       # Client main app (go run ./cmd/client)
-│   └── server/       # Server main app (go run ./cmd/server)
-├── crypto/           # Crypto: encryption, key exchange, session keys
-├── identity/         # Token creation and verification
-├── protocol/         # Framing: custom binary frame format
-├── transport/        # StreamRouter, UploadManager, main transport logic
-└── server_files/     # Server-side folder for uploaded/downloaded files
-🚀 Quick Start
-1. Start the Server
-bash
-Copy
-Edit
-go run ./cmd/server
-Server listens on :9999 by default.
+├── cmd/                  # Entry points
+│   ├── client/           # CLI client
+│   └── server/           # Main server
+├── transport/            # Core transport logic
+│   ├── server.go
+│   ├── client.go
+│   ├── stream_router.go
+│   └── upload_handler.go
+├── crypto/               # Key exchange, encryption
+├── identity/             # Token creation/verification
+├── protocol/             # Frame structs + constants
+├── server_files/         # Uploaded files stored here
+```
 
-2. Start the Client
-bash
-Copy
-Edit
-go run ./cmd/client
-You'll be connected securely and ready to type commands.
+---
 
-3. Available Commands
+## 🔮 Upcoming Features
 
-Command	Description
-ping	Pings the server
-status	Checks server status
-time	Gets server UTC time
-list	Lists available files (simulated)
-info	Shows ZTP server info
-echo <message>	Echoes back the message
-upload <filename>	Uploads a file to server
-download <filename>	Downloads a file from server
-exit	Disconnects client
-🛠 Technology Stack
-Language: Go 1.20+
+### 🧠 Session Resumption
 
-Crypto: Curve25519, ChaCha20-Poly1305
+* Cache client key/session ID for re-auth without full handshake
 
-Multiplexing: Custom logical streams
+### ❤️ Heartbeat Frames
 
-Framing: Custom lightweight binary protocol
+* Keep-alive pings every N seconds
+* Auto-close dead connections
 
-📜 Example Session
-bash
-Copy
-Edit
-$ go run ./cmd/client
+### 📊 Stream Priority & QoS
 
->> Connected! Type commands (ping, status, time, upload file.txt, download file.txt, etc.)
->> Type 'exit' to quit.
+* Assign weights to streams (e.g., control > chat > file)
+* Fair scheduling in congested conditions
 
-> ping
-[Server Reply]: pong
+### 🔁 Advanced Replay Protection
 
-> upload myfile.txt
-[Client] Upload complete!
+* Implement anti-replay sliding window
+* Detect reordered or replayed frames
 
-> download myfile.txt
-[Client] Downloaded 'myfile.txt' successfully
+### 📦 Compression Support
 
-> exit
-[Client] Exiting...
-📚 Protocol Flow (Simplified)
-plaintext
-Copy
-Edit
-Client                          Server
-  |                                |
-  |--- Ephemeral Public Key -----> |
-  |                                |
-  |<--- Ephemeral Public Key ----- |
-  |                                |
-  |--- Encrypted Identity Token -->|
-  |                                |
-  |<--- Session Established ------ |
-  |                                |
-  |--- Data Frames (Control/Chat) ->|
-  |<--- Response Frames -----------|
-🔥 Status
-✅ Fully operational MVP ready for expansion.
-✅ Secure, extensible, clean Go codebase.
+* Compress chat/file payloads (GZIP, Snappy)
+
+### 🌐 Multi-client Support
+
+* Serve multiple clients concurrently
+* Authenticate and manage client roles per connection
+
+---
+
+## 🧠 Design Goals
+
+* **Simplicity**: clear frame format, single entrypoint
+* **Security-first**: crypto defaults, nonce checks
+* **Extensibility**: plug-and-play stream logic
+* **Minimal Dependencies**: Go stdlib + crypto
+
+---
+
+## 🚀 Getting Started
+
+### Build CLI and Server
+
+```bash
+cd ztp
+go build -o ztp-client ./cmd/client
+go build -o ztp-server ./cmd/server
+```
+
+### Start Server
+
+```bash
+./ztp-server
+```
+
+### Start Client
+
+```bash
+./ztp-client --addr localhost:9999 ping
+```
+
+---
+
+## 👨‍💻 Authors
+
+Built with 🧠 by the ZTP Core Team. Drafted April 2025.
+
+---
+
+## 📜 License
+
+MIT © 2025
