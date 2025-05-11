@@ -24,6 +24,7 @@ var sessions = NewSessionManager()
 
 // StartServer launches the ZTP server
 func StartServer(address string) error {
+	sessions.StartCleanup(5 * time.Second)
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", address, err)

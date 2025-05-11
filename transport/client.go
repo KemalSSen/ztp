@@ -64,6 +64,9 @@ func StartClient(address string) error {
 	w.Write(tokenBytes)
 	w.Flush()
 
+	// Start Heartbeat
+	go startHeartbeat(w, sessionKey)
+
 	// Phase 3: Interactive session
 	console := bufio.NewReader(os.Stdin)
 	fmt.Println(">> Connected! Type commands (ping, status, time, upload file.txt, download file.txt, etc.)")
@@ -88,6 +91,11 @@ func StartClient(address string) error {
 			continue
 		}
 
+		if strings.HasPrefix(lower, "download ") {
+			handleDownload(r, w, sessionKey, input)
+			continue
+		}
+
 		streamID := uint32(2) // Control stream by default
 		nonce, _ := crypto.GenerateNonce()
 		ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(input), nil)
@@ -98,7 +106,6 @@ func StartClient(address string) error {
 
 		log.Printf("[Client] Sent command '%s' on Stream %d", input, streamID)
 
-		// Wait for server reply
 		responseFrame, err := protocol.Decode(r)
 		if err != nil {
 			if err == io.EOF {
@@ -111,6 +118,21 @@ func StartClient(address string) error {
 		fmt.Printf("[Server Reply]: %s\n", string(response))
 	}
 	return nil
+}
+
+func startHeartbeat(w *bufio.Writer, sessionKey [32]byte) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		nonce, _ := crypto.GenerateNonce()
+		payload, _ := crypto.Encrypt(sessionKey, nonce, []byte("ping"), nil)
+		frame, _ := protocol.NewFrameWithStream(2, protocol.TypeData, nonce, payload)
+		frameBytes, _ := frame.Encode()
+		w.Write(frameBytes)
+		w.Flush()
+		log.Println("[Heartbeat] Sent ping")
+	}
 }
 
 func handleUpload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, command string) {
@@ -208,4 +230,52 @@ func handleUpload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, command
 	w.Flush()
 
 	fmt.Println("[Client] Upload complete!")
+}
+
+func handleDownload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, command string) {
+	parts := strings.SplitN(command, " ", 2)
+	if len(parts) != 2 {
+		fmt.Println("[Client] Usage: download <filename>")
+		return
+	}
+	filename := parts[1]
+
+	// Step 1: Send "download <filename>" request
+	nonce, _ := crypto.GenerateNonce()
+	ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(command), nil)
+	frame, _ := protocol.NewFrameWithStream(2, protocol.TypeData, nonce, ciphertext)
+	frameBytes, _ := frame.Encode()
+	w.Write(frameBytes)
+	w.Flush()
+
+	// Step 2: Prepare to receive and write chunks
+	outFile, err := os.Create(filename + ".downloaded")
+	if err != nil {
+		fmt.Printf("[Client] Failed to create output file: %v\n", err)
+		return
+	}
+	defer outFile.Close()
+
+	for {
+		frame, err := protocol.Decode(r)
+		if err != nil {
+			fmt.Printf("[Client] Failed to read download chunk: %v\n", err)
+			return
+		}
+		plain, err := crypto.Decrypt(sessionKey, frame.Nonce, frame.Payload, nil)
+		if err != nil {
+			fmt.Printf("[Client] Failed to decrypt chunk: %v\n", err)
+			return
+		}
+		if string(plain) == protocol.UploadEndMarker {
+			break
+		}
+		_, err = outFile.Write(plain)
+		if err != nil {
+			fmt.Printf("[Client] Failed to write to file: %v\n", err)
+			return
+		}
+	}
+
+	fmt.Println("[Client] Download complete:", filename+".downloaded")
 }

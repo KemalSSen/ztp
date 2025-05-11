@@ -82,6 +82,7 @@ type StreamRouter struct {
 	lock          sync.RWMutex
 	roles         map[uint32]string // add to struct
 	replayBuffer  *ReplayBuffer
+	streamChans   map[uint32]chan *protocol.Frame
 }
 
 func NewStreamRouter(sessionKey [32]byte, writer *bufio.Writer) *StreamRouter {
@@ -96,7 +97,7 @@ func NewStreamRouter(sessionKey [32]byte, writer *bufio.Writer) *StreamRouter {
 		metrics:       make(map[uint32]*StreamMetrics),
 		roles:         make(map[uint32]string), // ✅ this is what you need
 		replayBuffer:  NewReplayBuffer(1000),   // tracks last 1000 nonces
-
+		streamChans:   make(map[uint32]chan *protocol.Frame),
 	}
 }
 
@@ -149,6 +150,7 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 	nonceKey := string(frame.Nonce[:])
 	if sr.replayBuffer.Seen(nonceKey) {
 		log.Printf("[Router] Replay detected for nonce %x, stream %d", frame.Nonce, frame.StreamID)
+		sr.resetTimer(frame.StreamID)
 		return
 	}
 	sr.usedNonces[nonceKey] = struct{}{}
@@ -185,7 +187,13 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 		sr.rateLimits[frame.StreamID] = NewRateLimiter(10, 20)
 	}
 
-	go sr.handleFrameDispatch(frame.StreamID, frame)
+	ch, exists := sr.streamChans[frame.StreamID]
+	if !exists {
+		ch = make(chan *protocol.Frame, 10)
+		sr.streamChans[frame.StreamID] = ch
+		go sr.handleStream(frame.StreamID, ch)
+	}
+	ch <- frame
 }
 
 func (sr *StreamRouter) startUpload(streamID uint32, command string) {
@@ -359,9 +367,29 @@ func (sr *StreamRouter) handleStream(streamID uint32, ch chan *protocol.Frame) {
 		}
 		message := string(plaintext)
 
+		// Priority guessing if not already set
+		sr.lock.Lock()
+		if _, ok := sr.priorities[streamID]; !ok {
+			cmd := strings.ToLower(message)
+			if strings.HasPrefix(cmd, "ping") ||
+				strings.HasPrefix(cmd, "upload") ||
+				strings.HasPrefix(cmd, "download") ||
+				strings.HasPrefix(cmd, "status") ||
+				strings.HasPrefix(cmd, "resume") ||
+				strings.HasPrefix(cmd, "list") ||
+				strings.HasPrefix(cmd, "info") ||
+				strings.HasPrefix(cmd, "echo") {
+				sr.priorities[streamID] = PriorityControl
+			} else {
+				sr.priorities[streamID] = PriorityChat
+			}
+		}
+		sr.lock.Unlock()
+
 		if sr.uploadManager.IsUploading(streamID) {
 			if sr.uploadManager.HandleChunk(streamID, plaintext) {
 				sr.sendResponse(streamID, "Upload complete")
+				sr.CloseStream(streamID)
 			}
 			continue
 		}
@@ -425,14 +453,17 @@ func (sr *StreamRouter) CloseStream(streamID uint32) {
 	delete(sr.priorities, streamID)
 	sr.uploadManager.AbortUpload(streamID)
 
-	// Print metrics summary
+	if ch, ok := sr.streamChans[streamID]; ok {
+		close(ch)
+		delete(sr.streamChans, streamID)
+	}
+
 	if m, ok := sr.metrics[streamID]; ok {
 		log.Printf("[Metrics] Stream %d: %d msgs | %dB in | %dB out | %d decrypt fails",
 			streamID, m.Messages, m.BytesIn, m.BytesOut, m.DecryptFails)
 		delete(sr.metrics, streamID)
 	}
 	log.Printf("[Router] Closing stream %d", streamID)
-
 }
 
 func (sr *StreamRouter) CloseAll() {

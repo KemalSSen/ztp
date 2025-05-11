@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -23,6 +24,7 @@ func NewSessionManager() *SessionManager {
 }
 
 func (sm *SessionManager) Save(clientID string, sess Session) {
+	sess.LastSeen = time.Now().Add(-20 * time.Second)
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	sess.LastSeen = time.Now()
@@ -41,4 +43,21 @@ func (sm *SessionManager) Load(clientID string) (Session, bool) {
 		return Session{}, false
 	}
 	return sess, true
+}
+
+func (sm *SessionManager) StartCleanup(interval time.Duration) {
+	go func() {
+		for {
+			time.Sleep(interval)
+			sm.lock.Lock()
+			now := time.Now()
+			for id, sess := range sm.store {
+				if now.Sub(sess.LastSeen) > 15*time.Second {
+					delete(sm.store, id)
+					log.Printf("[SessionManager] Cleaned up expired session: %s", id)
+				}
+			}
+			sm.lock.Unlock()
+		}
+	}()
 }
