@@ -105,7 +105,8 @@ func handleConnection(conn net.Conn) {
 	}
 	log.Printf("[ZTP] Authenticated client: %s with role: %s", claims.ClientID, claims.Role)
 	log.Println("[ZTP] Handshake complete. Secure session established.")
-
+	// Save client identity
+	sessions.SaveWriter(claims.ClientID, w)
 	// Save session for resume
 	sessions.Save(claims.ClientID, Session{
 		Key:      sessionKey,

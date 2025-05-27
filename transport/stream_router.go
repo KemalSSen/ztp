@@ -177,7 +177,11 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 				strings.HasPrefix(cmd, "upload") ||
 				strings.HasPrefix(cmd, "download") ||
 				strings.HasPrefix(cmd, "status") ||
-				strings.HasPrefix(cmd, "resume") { // ✅ Add this
+				strings.HasPrefix(cmd, "resume") ||
+				strings.HasPrefix(cmd, "info") ||
+				strings.HasPrefix(cmd, "time") ||
+				strings.HasPrefix(cmd, "list") ||
+				strings.HasPrefix(cmd, "chatlist") {
 				sr.priorities[frame.StreamID] = PriorityControl
 			} else {
 				sr.priorities[frame.StreamID] = PriorityChat
@@ -197,21 +201,33 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 }
 
 func (sr *StreamRouter) startUpload(streamID uint32, command string) {
-	parts := strings.SplitN(command, " ", 2)
-	if len(parts) != 2 {
-		sr.sendResponse(streamID, "Invalid upload command")
+	parts := strings.Fields(command)
+	if len(parts) < 2 {
+		sr.sendResponse(streamID, "Usage: upload <filename> or upload --gzip <filename>")
 		return
 	}
 
-	raw := parts[1]
 	isGzipped := false
+	filename := ""
 
-	if strings.HasPrefix(raw, "gzip ") {
+	// Desteklenen formatlar:
+	// 1. upload file.txt
+	// 2. upload --gzip file.txt
+	// 3. upload-gzip file.txt
+	if parts[0] == "upload-gzip" && len(parts) == 2 {
 		isGzipped = true
-		raw = strings.TrimPrefix(raw, "gzip ")
+		filename = parts[1]
+	} else if parts[0] == "upload" && len(parts) == 3 && parts[1] == "--gzip" {
+		isGzipped = true
+		filename = parts[2]
+	} else if parts[0] == "upload" && len(parts) == 2 {
+		isGzipped = false
+		filename = parts[1]
+	} else {
+		sr.sendResponse(streamID, "Invalid upload command format")
+		return
 	}
 
-	filename := raw
 	offset, err := sr.uploadManager.StartUpload(streamID, filename)
 	if err != nil {
 		sr.sendResponse(streamID, fmt.Sprintf("Failed to start upload: %v", err))
@@ -225,7 +241,7 @@ func (sr *StreamRouter) startUpload(streamID uint32, command string) {
 	}
 	sr.uploadManager.lock.Unlock()
 
-	log.Printf("[Router] Stream %d ready to receive file: %s at offset %d", streamID, filename, offset)
+	log.Printf("[Router] Stream %d ready to receive file: %s at offset %d (gzip: %v)", streamID, filename, offset, isGzipped)
 	sr.sendResponse(streamID, fmt.Sprintf("Ready to receive file at offset %d", offset))
 }
 
@@ -316,8 +332,25 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 		sr.sessionKey = sess.Key
 		sr.roles[streamID] = sess.Role
 		response = "Session resumed for " + clientID
+	case "chatlist":
+		sessions.lock.RLock()
+		ids := make([]string, 0)
+		for id := range sessions.store {
+			ids = append(ids, id)
+		}
+		sessions.lock.RUnlock()
+
+		if len(ids) == 0 {
+			response = "No active clients"
+		} else {
+			response = "Active clients: " + strings.Join(ids, ", ")
+		}
 
 	default:
+		if strings.HasPrefix(command, "chat @") {
+			sr.handleChatMessage(streamID, strings.TrimPrefix(command, "chat "))
+			return
+		}
 		response = "Unknown command"
 	}
 	log.Printf("[Router] Stream %d: Control -> %s", streamID, command)
@@ -325,8 +358,79 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 }
 
 func (sr *StreamRouter) handleChatMessage(streamID uint32, message string) {
-	log.Printf("[Router] Stream %d: Chat -> %s", streamID, message)
-	sr.sendResponse(streamID, message)
+	sender := sr.roles[streamID]
+	if sender == "" {
+		sender = "unknown"
+	}
+
+	// 🎯 Eğer mesaj "@clientID mesaj" şeklindeyse → Private Message
+	if strings.HasPrefix(message, "@") {
+		parts := strings.SplitN(message, " ", 2)
+		if len(parts) != 2 {
+			sr.sendResponse(streamID, "⚠️ Usage: @clientID your message")
+			return
+		}
+
+		targetID := strings.TrimPrefix(parts[0], "@")
+		content := parts[1]
+
+		sessions.lock.RLock()
+		targetSess, ok := sessions.store[targetID]
+		sessions.lock.RUnlock()
+
+		if !ok || targetSess.Writer == nil {
+			sr.sendResponse(streamID, fmt.Sprintf("⚠️ Client @%s not found or offline", targetID))
+			return
+		}
+
+		msg := fmt.Sprintf("[PM from %s]: %s", sender, content)
+		nonce, _ := crypto.GenerateNonce()
+		encrypted, _ := crypto.Encrypt(targetSess.Key, nonce, []byte(msg), nil)
+		frame, _ := protocol.NewFrameWithStream(3, protocol.TypeData, nonce, encrypted)
+		data, _ := frame.Encode()
+
+		targetSess.Writer.Write(data)
+		targetSess.Writer.Flush()
+
+		sr.sendResponse(streamID, fmt.Sprintf("✅ Sent private message to @%s", targetID))
+		log.Printf("[PM] %s -> %s: %s", sender, targetID, content)
+		return
+	}
+
+	// 📣 Broadcast Chat
+	broadcastMsg := fmt.Sprintf("[Chat] %s: %s", sender, message)
+
+	sessions.lock.RLock()
+	defer sessions.lock.RUnlock()
+
+	for id, sess := range sessions.store {
+		if id == sender || sess.Writer == nil {
+			continue
+		}
+
+		nonce, err := crypto.GenerateNonce()
+		if err != nil {
+			continue
+		}
+		encrypted, err := crypto.Encrypt(sess.Key, nonce, []byte(broadcastMsg), nil)
+		if err != nil {
+			continue
+		}
+		frame, err := protocol.NewFrameWithStream(3, protocol.TypeData, nonce, encrypted)
+		if err != nil {
+			continue
+		}
+		data, err := frame.Encode()
+		if err != nil {
+			continue
+		}
+
+		sess.Writer.Write(data)
+		sess.Writer.Flush()
+	}
+
+	sr.sendResponse(streamID, "✅ Broadcast sent to all connected clients")
+	log.Printf("[Broadcast] %s: %s", sender, message)
 }
 
 func (sr *StreamRouter) allowFrame(streamID uint32) bool {
@@ -395,7 +499,7 @@ func (sr *StreamRouter) handleStream(streamID uint32, ch chan *protocol.Frame) {
 		}
 
 		if sr.priorities[streamID] == PriorityControl {
-			if strings.HasPrefix(message, "upload ") {
+			if strings.HasPrefix(message, "upload ") || strings.HasPrefix(message, "upload-gzip ") {
 				sr.startUpload(streamID, message)
 			} else if strings.HasPrefix(message, "download ") {
 				sr.startDownload(streamID, message)

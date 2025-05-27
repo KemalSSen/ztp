@@ -80,8 +80,15 @@ func (um *UploadManager) StartUpload(streamID uint32, filename string) (int64, e
 			return 0, fmt.Errorf("gzip reader setup failed: %v", err)
 		}
 		go func() {
-			defer gr.Close()
-			io.Copy(file, gr)
+			defer func() {
+				gr.Close()
+				file.Close()
+			}()
+			if _, err := io.Copy(file, gr); err != nil {
+				log.Printf("[UploadManager] Failed to decompress and write: %v", err)
+			} else {
+				log.Printf("[UploadManager] GZIP upload complete for %s", filename)
+			}
 		}()
 	}
 
@@ -105,14 +112,16 @@ func (um *UploadManager) HandleChunk(streamID uint32, chunk []byte) bool {
 		if state.IsGzipped && state.pipeW != nil {
 			state.pipeW.Close()
 		}
-		state.File.Close()
+		if !state.IsGzipped {
+			state.File.Close()
+		}
 		delete(um.activeUploads, streamID)
 		return true
 	}
 
 	if state.IsGzipped && state.pipeW != nil {
 		if _, err := state.pipeW.Write(chunk); err != nil {
-			log.Printf("[UploadManager] Failed to write gzip chunk: %v", err)
+			log.Printf("[UploadManager] Failed to write to gzip pipe: %v", err)
 			return false
 		}
 	} else {

@@ -16,7 +16,7 @@ import (
 	"ztp/protocol"
 )
 
-func StartClient(address string) error {
+func StartClient(address string, clientID string) error {
 	conn, err := net.Dial("tcp", address)
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
@@ -53,7 +53,8 @@ func StartClient(address string) error {
 	log.Printf("[DEBUG] Session Key: %x", sessionKey)
 
 	// Phase 2: Authentication
-	token, err := identity.CreateToken("kemal-client", "admin", 5*time.Minute)
+	token, err := identity.CreateToken(clientID, "admin", 5*time.Minute)
+
 	if err != nil {
 		return fmt.Errorf("token creation failed: %w", err)
 	}
@@ -65,7 +66,8 @@ func StartClient(address string) error {
 	w.Flush()
 
 	// Start Heartbeat
-	go startHeartbeat(w, sessionKey)
+	//go startHeartbeat(w, sessionKey)
+	//go listenForChats(r, sessionKey)
 
 	// Phase 3: Interactive session
 	console := bufio.NewReader(os.Stdin)
@@ -86,17 +88,59 @@ func StartClient(address string) error {
 		}
 
 		lower := strings.ToLower(input)
+		cmdWord := strings.SplitN(lower, " ", 2)[0] // ilk kelimeyi al
+
+		// Kontrol komutları
+		controlCommands := map[string]bool{
+			"ping":     true,
+			"status":   true,
+			"time":     true,
+			"info":     true,
+			"list":     true,
+			"chatlist": true,
+		}
+
+		// Eğer komut kontrol komutlarından biriyse
+		if controlCommands[cmdWord] {
+			streamID := uint32(2)
+			nonce, _ := crypto.GenerateNonce()
+			ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(input), nil)
+			frame, _ := protocol.NewFrameWithStream(streamID, protocol.TypeData, nonce, ciphertext)
+			frameBytes, _ := frame.Encode()
+			w.Write(frameBytes)
+			w.Flush()
+
+			responseFrame, err := protocol.Decode(r)
+			if err != nil {
+				log.Printf("[Client] Failed to decode response: %v", err)
+				continue
+			}
+			plain, _ := crypto.Decrypt(sessionKey, responseFrame.Nonce, responseFrame.Payload, nil)
+			fmt.Printf("[Server Reply]: %s\n", string(plain))
+			continue
+		}
+
+		// Private message: chat @clientID message
+		// Private message: chat @clientID message
+		if strings.HasPrefix(lower, "chat @") {
+			sendPrivateMessageWithRetry(r, w, sessionKey, input)
+			continue
+		}
+
+		// upload
 		if strings.HasPrefix(lower, "upload ") {
 			handleUpload(r, w, sessionKey, input)
 			continue
 		}
 
+		// download
 		if strings.HasPrefix(lower, "download ") {
 			handleDownload(r, w, sessionKey, input)
 			continue
 		}
 
-		streamID := uint32(2) // Control stream by default
+		// varsayılan chat mesajı (yayın veya bilinmeyen komut)
+		streamID := uint32(2)
 		nonce, _ := crypto.GenerateNonce()
 		ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(input), nil)
 		frame, _ := protocol.NewFrameWithStream(streamID, protocol.TypeData, nonce, ciphertext)
@@ -117,10 +161,43 @@ func StartClient(address string) error {
 		response, _ := crypto.Decrypt(sessionKey, responseFrame.Nonce, responseFrame.Payload, nil)
 		fmt.Printf("[Server Reply]: %s\n", string(response))
 	}
+
 	return nil
 }
 
-func startHeartbeat(w *bufio.Writer, sessionKey [32]byte) {
+func sendPrivateMessageWithRetry(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, input string) {
+	const maxRetries = 3
+	const retryDelay = 2 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		nonce, _ := crypto.GenerateNonce()
+		ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(input), nil)
+		frame, _ := protocol.NewFrameWithStream(2, protocol.TypeData, nonce, ciphertext)
+		frameBytes, _ := frame.Encode()
+		w.Write(frameBytes)
+		w.Flush()
+
+		responseFrame, err := protocol.Decode(r)
+		if err != nil {
+			log.Printf("[Client] Failed to decode response (attempt %d): %v", attempt, err)
+			return
+		}
+		plain, _ := crypto.Decrypt(sessionKey, responseFrame.Nonce, responseFrame.Payload, nil)
+		responseStr := string(plain)
+
+		fmt.Printf("[Server Reply]: %s\n", responseStr)
+
+		if strings.Contains(responseStr, "not found") || strings.Contains(responseStr, "offline") {
+			log.Printf("[Retry] Target client unavailable, retrying in %s (%d/%d)...", retryDelay, attempt, maxRetries)
+			time.Sleep(retryDelay)
+			continue
+		} else {
+			break
+		}
+	}
+}
+
+/*func startHeartbeat(w *bufio.Writer, sessionKey [32]byte) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
@@ -133,29 +210,72 @@ func startHeartbeat(w *bufio.Writer, sessionKey [32]byte) {
 		w.Flush()
 		log.Println("[Heartbeat] Sent ping")
 	}
+}*/
+
+func listenForChats(r *bufio.Reader, sessionKey [32]byte) {
+	for {
+		frame, err := protocol.Decode(r)
+		if err != nil {
+			log.Printf("[Chat] Listener error: %v", err)
+			return
+		}
+
+		if frame.StreamID != 3 {
+			continue // sadece chat stream'ini dinle
+		}
+
+		msg, err := crypto.Decrypt(sessionKey, frame.Nonce, frame.Payload, nil)
+		if err != nil {
+			log.Printf("[Chat] Failed to decrypt message: %v", err)
+			continue
+		}
+
+		fmt.Printf("\n[Chat] %s\n> ", string(msg))
+	}
 }
 
 func handleUpload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, command string) {
 	useGzip := false
 	var filename string
+	var serverCommand string
 
-	if strings.HasPrefix(command, "upload --gzip ") {
-		useGzip = true
-		realFile := strings.TrimPrefix(command, "upload --gzip ")
-		command = "upload-gzip " + realFile
-		filename = realFile
-	} else {
-		parts := strings.SplitN(command, " ", 2)
-		if len(parts) != 2 {
-			fmt.Println("[Client] Usage: upload <filename>")
+	// Komutu parçala: örnekler -> upload test.txt, upload --gzip test.txt, upload-gzip test.txt
+	parts := strings.Fields(command)
+	if len(parts) < 2 {
+		fmt.Println("[Client] Usage: upload <filename> | upload --gzip <filename> | upload-gzip <filename>")
+		return
+	}
+
+	switch parts[0] {
+	case "upload":
+		if len(parts) == 3 && parts[1] == "--gzip" {
+			useGzip = true
+			filename = parts[2]
+			serverCommand = "upload-gzip " + filename
+		} else if len(parts) == 2 {
+			filename = parts[1]
+			serverCommand = "upload " + filename
+		} else {
+			fmt.Println("[Client] Invalid upload syntax.")
 			return
 		}
-		filename = parts[1]
+	case "upload-gzip":
+		if len(parts) == 2 {
+			useGzip = true
+			filename = parts[1]
+			serverCommand = "upload-gzip " + filename
+		} else {
+			fmt.Println("[Client] Invalid upload-gzip syntax.")
+			return
+		}
+	default:
+		fmt.Println("[Client] Unknown upload command.")
+		return
 	}
 
 	// Step 1: Send command to server
 	nonce, _ := crypto.GenerateNonce()
-	ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(command), nil)
+	ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(serverCommand), nil)
 	frame, _ := protocol.NewFrameWithStream(2, protocol.TypeData, nonce, ciphertext)
 	frameBytes, _ := frame.Encode()
 	w.Write(frameBytes)
@@ -248,8 +368,14 @@ func handleDownload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, comma
 	w.Write(frameBytes)
 	w.Flush()
 
-	// Step 2: Prepare to receive and write chunks
-	outFile, err := os.Create(filename + ".downloaded")
+	// Step 2: Determine output file name
+	outputName := filename + ".downloaded"
+	if strings.HasSuffix(filename, ".gz") {
+		outputName = filename // .gz dosyası olduğu gibi indirilsin
+	}
+
+	// Step 3: Prepare to receive and write chunks
+	outFile, err := os.Create(outputName)
 	if err != nil {
 		fmt.Printf("[Client] Failed to create output file: %v\n", err)
 		return
@@ -277,5 +403,8 @@ func handleDownload(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, comma
 		}
 	}
 
-	fmt.Println("[Client] Download complete:", filename+".downloaded")
+	fmt.Printf("[Client] Download complete: %s\n", outputName)
+	if strings.HasSuffix(outputName, ".gz") {
+		fmt.Println("[Client] GZIP file detected. You can extract it manually with 'gunzip', 'gzip -d', or a file archiver.")
+	}
 }

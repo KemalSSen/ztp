@@ -16,11 +16,12 @@ import (
 
 func main() {
 	addr := flag.String("addr", "localhost:9999", "Address of the ZTP server")
+	id := flag.String("id", "default-client", "Client identity")
 
 	flag.Parse()
 
 	if flag.NArg() < 1 {
-		if err := transport.StartClient(*addr); err != nil {
+		if err := transport.StartClient(*addr, *id); err != nil {
 			log.Fatalf("[ztp-client] Error: %v", err)
 		}
 

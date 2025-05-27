@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bufio"
 	"log"
 	"sync"
 	"time"
@@ -9,6 +10,7 @@ import (
 type Session struct {
 	Key      [32]byte
 	Role     string
+	Writer   *bufio.Writer
 	LastSeen time.Time
 }
 
@@ -24,11 +26,20 @@ func NewSessionManager() *SessionManager {
 }
 
 func (sm *SessionManager) Save(clientID string, sess Session) {
-	sess.LastSeen = time.Now().Add(-20 * time.Second)
+	sess.LastSeen = time.Now().Add(-20 * time.Second) // Simulate a delay for testing
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	sess.LastSeen = time.Now()
 	sm.store[clientID] = sess
+}
+
+func (sm *SessionManager) SaveWriter(clientID string, w *bufio.Writer) {
+	sm.lock.Lock()
+	if sess, ok := sm.store[clientID]; ok {
+		sess.Writer = w
+		sm.store[clientID] = sess
+	}
+	sm.lock.Unlock()
 }
 
 func (sm *SessionManager) Load(clientID string) (Session, bool) {
@@ -38,7 +49,7 @@ func (sm *SessionManager) Load(clientID string) (Session, bool) {
 	if !ok {
 		return Session{}, false
 	}
-	if time.Since(sess.LastSeen) > 10*time.Minute {
+	if time.Since(sess.LastSeen) > 5*time.Minute {
 		// Session expired
 		return Session{}, false
 	}
@@ -52,7 +63,7 @@ func (sm *SessionManager) StartCleanup(interval time.Duration) {
 			sm.lock.Lock()
 			now := time.Now()
 			for id, sess := range sm.store {
-				if now.Sub(sess.LastSeen) > 15*time.Second {
+				if now.Sub(sess.LastSeen) > 5*time.Minute {
 					delete(sm.store, id)
 					log.Printf("[SessionManager] Cleaned up expired session: %s", id)
 				}
