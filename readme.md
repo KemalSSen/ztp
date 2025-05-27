@@ -1,113 +1,8 @@
-# Zero Trust Protocol (ZTP)
+# ZTP (Zero Trust Protocol) - Secure TCP Communication Framework
 
-## Overview
+## ✨ Overview
 
-ZTP (Zero Trust Protocol) is a secure, encrypted, and authenticated transport protocol designed to operate over untrusted networks. It uses modern cryptographic primitives, a stream-multiplexed architecture, and token-based identity verification to ensure confidentiality, integrity, and access control.
-
----
-
-## ✨ Key Features
-
-### 🔐 Security
-
-* **Encryption**: End-to-end encryption using ChaCha20-Poly1305 AEAD.
-* **Authentication**: Client identity verified using signed HMAC-SHA256 tokens.
-* **Replay Protection**: Each message includes a unique nonce.
-* **Tamper Detection**: Poly1305 ensures integrity and authenticity.
-
-### 🧩 Modular Design
-
-* Supports multiple **logical streams** over a single TCP connection.
-* Control and application traffic separated via **stream IDs**.
-* Upload/download with resumable support via server-managed offsets.
-
-### 🛠️ Developer Friendly
-
-* Easy-to-use CLI and client library.
-* Fully extendable and modular backend.
-* Detailed debug and logging output.
-
-### 📈 Metrics & Observability
-
-* Tracks per-stream: message count, inbound/outbound bytes, decrypt failures.
-* Cleaned up on stream close or timeout.
-
----
-
-## 🧪 Current Functionality
-
-### ✅ Secure Handshake
-
-1. ECDH Key Exchange (Curve25519)
-2. Derive 32-byte session key via SHA-256
-3. Encrypted identity token from client to server
-4. Role verification and session start
-
-### ✅ Frame Format
-
-| Field    | Size (bytes) | Description              |
-| -------- | ------------ | ------------------------ |
-| Version  | 2            | Protocol version         |
-| Type     | 2            | Frame type               |
-| StreamID | 4            | Logical stream ID        |
-| Nonce    | 12           | Encryption nonce         |
-| Length   | 4            | Encrypted payload length |
-| Payload  | Variable     | AEAD-encrypted data      |
-
-### ✅ Message Types
-
-* `0x01` - HandshakeInit
-* `0x02` - HandshakeAck (planned)
-* `0x03` - Encrypted Data
-* `0x04` - Stream/Connection Close
-
-### ✅ Streams
-
-* `1` - Chat messages
-* `2` - Control commands (e.g. ping, time, echo)
-* `N` - Arbitrary, per-client streams (file transfers, uploads, etc.)
-
-### ✅ Supported Commands
-
-| Command    | Description                     |
-| ---------- | ------------------------------- |
-| `ping`     | Server replies with `pong`      |
-| `status`   | Shows server status             |
-| `time`     | Returns current UTC time        |
-| `info`     | Returns server description      |
-| `echo`     | Echoes back the user message    |
-| `list`     | Lists available files           |
-| `upload`   | Upload a file to the server     |
-| `download` | Download a file from the server |
-
-### ✅ Uploads
-
-* Streamed over Stream ID `2`
-* Server saves to `server_files/<filename>`
-* Supports resumable uploads via file offset
-
-### ✅ Downloads
-
-* Server reads file and streams back in 1024B chunks
-* Ends with `[EOF]` marker
-* Saved as `downloaded_<filename>` on client
-
-### ✅ CLI Client
-
-Usage:
-
-```bash
-ztp-client --addr <host:port> <command> [args]
-```
-
-Examples:
-
-```bash
-ztp-client --addr localhost:9999 ping
-ztp-client --addr localhost:9999 upload notes.txt
-ztp-client --addr localhost:9999 download notes.txt
-ztp-client --addr localhost:9999 chat "hello world"
-```
+ZTP is a custom-designed, secure communication protocol built over TCP, using modern cryptographic primitives (X25519, ChaCha20-Poly1305, HMAC) to ensure confidentiality, integrity, and authentication in peer-to-peer or client-server models. It features encrypted file transfers, distributed role-based messaging, streaming upload/download support, replay-attack mitigation, and extensible modular design.
 
 ---
 
@@ -115,93 +10,172 @@ ztp-client --addr localhost:9999 chat "hello world"
 
 ```
 ztp/
-├── cmd/                  # Entry points
-│   ├── client/           # CLI client
-│   └── server/           # Main server
-├── transport/            # Core transport logic
-│   ├── server.go
-│   ├── client.go
-│   ├── stream_router.go
-│   └── upload_handler.go
-├── crypto/               # Key exchange, encryption
-├── identity/             # Token creation/verification
-├── protocol/             # Frame structs + constants
-├── server_files/         # Uploaded files stored here
+├── cmd/               # CLI entry points for client & server
+│   ├── ztp-client/
+│   └── ztp-server/
+├── crypto/            # X25519 key exchange, ChaCha20 encryption, HMAC
+├── identity/          # JWT-based role authentication
+├── protocol/          # Frame encoding/decoding & constants
+├── transport/         # StreamRouter, UploadManager, and communication logic
+├── server_files/      # Directory for uploaded files
+├── go.mod
+└── README.md
 ```
 
 ---
 
-## 🔮 Upcoming Features
+## 🌐 Protocol Design
 
-### 🧠 Session Resumption
+### ▶ Frame Structure
 
-* Cache client key/session ID for re-auth without full handshake
+Each encrypted message sent between client and server is wrapped in a custom frame:
 
-### ❤️ Heartbeat Frames
+| Field      | Size (Bytes) | Description                           |
+| ---------- | ------------ | ------------------------------------- |
+| StreamID   | 4            | Identifier for logical communication  |
+| FrameType  | 1            | Type (Handshake, Data, Control, etc.) |
+| Nonce      | 12           | Random nonce for AEAD encryption      |
+| PayloadLen | 4            | Length of encrypted payload           |
+| Payload    | Variable     | ChaCha20-Poly1305 encrypted data      |
 
-* Keep-alive pings every N seconds
-* Auto-close dead connections
+* **FrameType** enum:
 
-### 📊 Stream Priority & QoS
+  * `TypeHandshakeInit = 0x01`
+  * `TypeData = 0x02`
+  * `TypeAck = 0x03`
 
-* Assign weights to streams (e.g., control > chat > file)
-* Fair scheduling in congested conditions
+### Nonce Usage
 
-### 🔁 Advanced Replay Protection
-
-* Implement anti-replay sliding window
-* Detect reordered or replayed frames
-
-### 📦 Compression Support
-
-* Compress chat/file payloads (GZIP, Snappy)
-
-### 🌐 Multi-client Support
-
-* Serve multiple clients concurrently
-* Authenticate and manage client roles per connection
+Each frame includes a unique 96-bit nonce generated using `crypto/rand`. Nonce ensures semantic security for AEAD and prevents replay attacks. All previously used nonces are cached and checked server-side (via `ReplayBuffer`).
 
 ---
 
-## 🧠 Design Goals
+## 🔐 Cryptography
 
-* **Simplicity**: clear frame format, single entrypoint
-* **Security-first**: crypto defaults, nonce checks
-* **Extensibility**: plug-and-play stream logic
-* **Minimal Dependencies**: Go stdlib + crypto
+* **Key Exchange**: X25519 (Elliptic Curve Diffie-Hellman)
+* **Session Encryption**: ChaCha20-Poly1305 AEAD
+* **Integrity**: AEAD internal + optional HMAC
+* **Token Authentication**: JWT (ES256)
+
+Session key is derived via `HKDF(shared_secret, "ztp-handshake")`.
 
 ---
 
-## 🚀 Getting Started
+## 🎓 Authentication & Roles
 
-### Build CLI and Server
+* Client generates JWT via `identity.CreateToken(clientID, role)`
+* JWT is encrypted and sent in the handshake frame
+* Server verifies signature and extracts `clientID`, `role`
+
+Roles can be used to restrict features (e.g. download-only, admin, etc.)
+
+---
+
+## 🚀 Core Components
+
+### Client Logic (StartClient)
+
+* Performs key exchange and handshake
+* Authenticates via token
+* Parses user input and dispatches commands
+* Handles uploads/downloads, chats, control commands
+
+### Server Logic (StreamRouter)
+
+* Receives and decrypts frames
+* Determines stream type (control/chat/upload)
+* Starts `UploadManager` or command handler based on priority
+* Sends response frames with encrypted data
+
+---
+
+## 📄 Upload Workflow
+
+1. Client sends: `upload notes.txt`
+2. Server responds: `Ready to receive file at offset X`
+3. Client streams encrypted file chunks
+4. Server writes chunks using `UploadManager`
+5. Client sends `UploadEndMarker`
+6. Server finalizes and acknowledges
+
+### GZIP Support
+
+* If user sends `upload --gzip notes.txt`, the file is compressed on-the-fly using `gzip.NewWriter` and streamed through `io.Pipe`.
+
+---
+
+## 📥 Download Workflow
+
+1. Client sends: `download file.txt`
+2. Server reads the file
+3. Splits into encrypted chunks
+4. Sends chunks in multiple frames
+5. Appends `UploadEndMarker`
+
+---
+
+## ⚖️ Security Features
+
+| Feature                   | Mechanism                     |
+| ------------------------- | ----------------------------- |
+| Confidentiality           | ChaCha20-Poly1305 AEAD        |
+| Authentication            | JWT with ECDSA (ES256)        |
+| Replay protection         | Nonce tracking (ReplayBuffer) |
+| Stream isolation          | Unique StreamIDs              |
+| Session hijack prevention | Key-pair per session          |
+| Role-based access         | Claims in JWT token           |
+
+---
+
+## ⚙️ Build & Run
 
 ```bash
-cd ztp
-go build -o ztp-client ./cmd/client
-go build -o ztp-server ./cmd/server
-```
+# Server
+cd cmd/ztp-server
+go run main.go
 
-### Start Server
-
-```bash
-./ztp-server
-```
-
-### Start Client
-
-```bash
-./ztp-client --addr localhost:9999 ping
+# Client
+cd cmd/ztp-client
+go run main.go --id your-client-id
 ```
 
 ---
 
-## 👨‍💻 Authors
+## 🚫 Known Limitations
 
-Built with 🧠 by the ZTP Core Team. Drafted April 2025.
+* No full retransmission logic for dropped frames
+* Private chat is partially implemented (broadcast works)
+* No certificate authority or mutual auth yet
+* No persistent storage or database
 
 ---
 
-## 📜 License
+## 🌐 Future Work
 
-MIT © 2025
+* Private message ACK + retries
+* WebSocket or HTTP-over-ZTP tunnel
+* REST API for admin control
+* GUI frontend with React
+* TLS-like certificate validation
+* More granular role permissions
+
+---
+
+## 📅 Contributors
+
+* Kemal Ş.
+* Ismail Serin
+
+
+---
+
+## ⚠️ Disclaimer
+
+This project is for educational purposes only. It is not recommended for use in production without a thorough security audit.
+
+---
+
+
+## 🧵 License
+
+MIT License
