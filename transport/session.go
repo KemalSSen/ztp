@@ -26,21 +26,20 @@ func NewSessionManager() *SessionManager {
 }
 
 func (sm *SessionManager) Save(clientID string, sess Session) {
-	sess.LastSeen = time.Now().Add(-20 * time.Second) // Simulate a delay for testing
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 	sess.LastSeen = time.Now()
 	sm.store[clientID] = sess
 }
 
-func (sm *SessionManager) SaveWriter(clientID string, w *bufio.Writer) {
+/*func (sm *SessionManager) SaveWriter(clientID string, w *bufio.Writer) {
 	sm.lock.Lock()
 	if sess, ok := sm.store[clientID]; ok {
 		sess.Writer = w
 		sm.store[clientID] = sess
 	}
 	sm.lock.Unlock()
-}
+}*/
 
 func (sm *SessionManager) Load(clientID string) (Session, bool) {
 	sm.lock.RLock()

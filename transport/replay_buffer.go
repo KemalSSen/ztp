@@ -17,10 +17,10 @@ func NewReplayBuffer(size int) *ReplayBuffer {
 
 func (rb *ReplayBuffer) Seen(nonce string) bool {
 	if _, exists := rb.seen[nonce]; exists {
-		return true // 🚫 replay
+		return true //  replay
 	}
 
-	// 👇 Evict oldest
+	//  Evict oldest
 	old := rb.queue[rb.index]
 	if old != "" {
 		delete(rb.seen, old)

@@ -54,7 +54,6 @@ func StartClient(address string, clientID string) error {
 
 	// Phase 2: Authentication
 	token, err := identity.CreateToken(clientID, "admin", 5*time.Minute)
-
 	if err != nil {
 		return fmt.Errorf("token creation failed: %w", err)
 	}
@@ -65,11 +64,13 @@ func StartClient(address string, clientID string) error {
 	w.Write(tokenBytes)
 	w.Flush()
 
-	// Start Heartbeat
-	//go startHeartbeat(w, sessionKey)
-	//go listenForChats(r, sessionKey)
+	// 🔁 Frame Routing Setup
+	controlChan := make(chan *protocol.Frame, 10)
+	chatChan := make(chan *protocol.Frame, 10)
 
-	// Phase 3: Interactive session
+	go routerReader(r, controlChan, chatChan) // centralized frame reader
+	go listenForChats(chatChan, sessionKey)   // async chat listener
+
 	console := bufio.NewReader(os.Stdin)
 	fmt.Println(">> Connected! Type commands (ping, status, time, upload file.txt, download file.txt, etc.)")
 	fmt.Println(">> Type 'exit' to quit.")
@@ -78,7 +79,7 @@ func StartClient(address string, clientID string) error {
 		fmt.Print("> ")
 		input, _ := console.ReadString('\n')
 		input = strings.TrimSpace(input)
-
+		input = strings.TrimPrefix(input, "> ")
 		if input == "" {
 			continue
 		}
@@ -88,9 +89,8 @@ func StartClient(address string, clientID string) error {
 		}
 
 		lower := strings.ToLower(input)
-		cmdWord := strings.SplitN(lower, " ", 2)[0] // ilk kelimeyi al
+		cmdWord := strings.SplitN(lower, " ", 2)[0]
 
-		// Kontrol komutları
 		controlCommands := map[string]bool{
 			"ping":     true,
 			"status":   true,
@@ -100,7 +100,6 @@ func StartClient(address string, clientID string) error {
 			"chatlist": true,
 		}
 
-		// Eğer komut kontrol komutlarından biriyse
 		if controlCommands[cmdWord] {
 			streamID := uint32(2)
 			nonce, _ := crypto.GenerateNonce()
@@ -110,36 +109,30 @@ func StartClient(address string, clientID string) error {
 			w.Write(frameBytes)
 			w.Flush()
 
-			responseFrame, err := protocol.Decode(r)
-			if err != nil {
-				log.Printf("[Client] Failed to decode response: %v", err)
-				continue
-			}
+			// 📨 Wait for reply on control stream
+			responseFrame := <-controlChan
 			plain, _ := crypto.Decrypt(sessionKey, responseFrame.Nonce, responseFrame.Payload, nil)
 			fmt.Printf("[Server Reply]: %s\n", string(plain))
 			continue
 		}
 
-		// Private message: chat @clientID message
-		// Private message: chat @clientID message
 		if strings.HasPrefix(lower, "chat @") {
-			sendPrivateMessageWithRetry(r, w, sessionKey, input)
+			sendPrivateMessageWithRetry(w, controlChan, sessionKey, input)
+
 			continue
 		}
 
-		// upload
 		if strings.HasPrefix(lower, "upload ") {
 			handleUpload(r, w, sessionKey, input)
 			continue
 		}
 
-		// download
 		if strings.HasPrefix(lower, "download ") {
 			handleDownload(r, w, sessionKey, input)
 			continue
 		}
 
-		// varsayılan chat mesajı (yayın veya bilinmeyen komut)
+		// Default broadcast chat or unknown command
 		streamID := uint32(2)
 		nonce, _ := crypto.GenerateNonce()
 		ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(input), nil)
@@ -150,14 +143,7 @@ func StartClient(address string, clientID string) error {
 
 		log.Printf("[Client] Sent command '%s' on Stream %d", input, streamID)
 
-		responseFrame, err := protocol.Decode(r)
-		if err != nil {
-			if err == io.EOF {
-				log.Println("[Client] Server closed connection.")
-				break
-			}
-			return fmt.Errorf("failed to decode server frame: %w", err)
-		}
+		responseFrame := <-controlChan
 		response, _ := crypto.Decrypt(sessionKey, responseFrame.Nonce, responseFrame.Payload, nil)
 		fmt.Printf("[Server Reply]: %s\n", string(response))
 	}
@@ -165,36 +151,38 @@ func StartClient(address string, clientID string) error {
 	return nil
 }
 
-func sendPrivateMessageWithRetry(r *bufio.Reader, w *bufio.Writer, sessionKey [32]byte, input string) {
-	const maxRetries = 3
-	const retryDelay = 2 * time.Second
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		nonce, _ := crypto.GenerateNonce()
-		ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(input), nil)
-		frame, _ := protocol.NewFrameWithStream(2, protocol.TypeData, nonce, ciphertext)
-		frameBytes, _ := frame.Encode()
-		w.Write(frameBytes)
-		w.Flush()
-
-		responseFrame, err := protocol.Decode(r)
+func routerReader(r *bufio.Reader, controlChan, chatChan chan *protocol.Frame) {
+	for {
+		frame, err := protocol.Decode(r)
 		if err != nil {
-			log.Printf("[Client] Failed to decode response (attempt %d): %v", attempt, err)
-			return
-		}
-		plain, _ := crypto.Decrypt(sessionKey, responseFrame.Nonce, responseFrame.Payload, nil)
-		responseStr := string(plain)
-
-		fmt.Printf("[Server Reply]: %s\n", responseStr)
-
-		if strings.Contains(responseStr, "not found") || strings.Contains(responseStr, "offline") {
-			log.Printf("[Retry] Target client unavailable, retrying in %s (%d/%d)...", retryDelay, attempt, maxRetries)
-			time.Sleep(retryDelay)
+			log.Printf("[Router] Error decoding frame: %v", err)
 			continue
-		} else {
-			break
+		}
+		switch frame.StreamID {
+		case 2:
+			controlChan <- frame
+		case 3:
+			chatChan <- frame
+		default:
+			log.Printf("[Router] Unknown stream ID: %d", frame.StreamID)
 		}
 	}
+}
+
+func sendPrivateMessageWithRetry(w *bufio.Writer, controlChan chan *protocol.Frame, sessionKey [32]byte, input string) {
+	streamID := uint32(2) // kontrol kanalı
+
+	nonce, _ := crypto.GenerateNonce()
+	ciphertext, _ := crypto.Encrypt(sessionKey, nonce, []byte(input), nil)
+	frame, _ := protocol.NewFrameWithStream(streamID, protocol.TypeData, nonce, ciphertext)
+	frameBytes, _ := frame.Encode()
+	w.Write(frameBytes)
+	w.Flush()
+
+	// Beklenen cevap controlChan üzerinden geliyor
+	responseFrame := <-controlChan
+	plain, _ := crypto.Decrypt(sessionKey, responseFrame.Nonce, responseFrame.Payload, nil)
+	fmt.Printf("[Server Reply]: %s\n", string(plain))
 }
 
 /*func startHeartbeat(w *bufio.Writer, sessionKey [32]byte) {
@@ -212,24 +200,13 @@ func sendPrivateMessageWithRetry(r *bufio.Reader, w *bufio.Writer, sessionKey [3
 	}
 }*/
 
-func listenForChats(r *bufio.Reader, sessionKey [32]byte) {
-	for {
-		frame, err := protocol.Decode(r)
-		if err != nil {
-			log.Printf("[Chat] Listener error: %v", err)
-			return
-		}
-
-		if frame.StreamID != 3 {
-			continue // sadece chat stream'ini dinle
-		}
-
+func listenForChats(chatChan chan *protocol.Frame, sessionKey [32]byte) {
+	for frame := range chatChan {
 		msg, err := crypto.Decrypt(sessionKey, frame.Nonce, frame.Payload, nil)
 		if err != nil {
-			log.Printf("[Chat] Failed to decrypt message: %v", err)
+			log.Printf("[Chat] Decryption failed: %v", err)
 			continue
 		}
-
 		fmt.Printf("\n[Chat] %s\n> ", string(msg))
 	}
 }

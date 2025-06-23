@@ -80,9 +80,10 @@ type StreamRouter struct {
 	usedNonces    map[string]struct{}
 	metrics       map[uint32]*StreamMetrics
 	lock          sync.RWMutex
-	roles         map[uint32]string // add to struct
+	roles         map[uint32]string
 	replayBuffer  *ReplayBuffer
 	streamChans   map[uint32]chan *protocol.Frame
+	names         map[uint32]string
 }
 
 func NewStreamRouter(sessionKey [32]byte, writer *bufio.Writer) *StreamRouter {
@@ -95,9 +96,10 @@ func NewStreamRouter(sessionKey [32]byte, writer *bufio.Writer) *StreamRouter {
 		uploadManager: NewUploadManager(),
 		usedNonces:    make(map[string]struct{}),
 		metrics:       make(map[uint32]*StreamMetrics),
-		roles:         make(map[uint32]string), // ✅ this is what you need
+		roles:         make(map[uint32]string), // tracks roles for each stream
 		replayBuffer:  NewReplayBuffer(1000),   // tracks last 1000 nonces
 		streamChans:   make(map[uint32]chan *protocol.Frame),
+		names:         make(map[uint32]string), // tracks stream names
 	}
 }
 
@@ -124,7 +126,7 @@ func (sr *StreamRouter) handleFrameDispatch(streamID uint32, frame *protocol.Fra
 	if sr.uploadManager.IsUploading(streamID) {
 		if sr.uploadManager.HandleChunk(streamID, plaintext) {
 			sr.sendResponse(streamID, "Upload complete")
-			sr.CloseStream(streamID) // ✅ graceful close
+			sr.CloseStream(streamID) //  graceful close
 		}
 		return
 	}
@@ -189,6 +191,10 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 		}
 		sr.timers[frame.StreamID] = sr.startTimer(frame.StreamID)
 		sr.rateLimits[frame.StreamID] = NewRateLimiter(10, 20)
+	}
+
+	if _, exists := sr.names[frame.StreamID]; !exists {
+		sr.names[frame.StreamID] = sr.names[1]
 	}
 
 	ch, exists := sr.streamChans[frame.StreamID]
@@ -278,14 +284,17 @@ func (sr *StreamRouter) startDownload(streamID uint32, command string) {
 }
 
 func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
-	cmdParts := strings.Fields(strings.ToLower(command))
+	command = strings.TrimSpace(command)
+	cmdParts := strings.Fields(command)
 	if len(cmdParts) == 0 {
 		sr.sendResponse(streamID, "Empty control command")
 		return
 	}
 
+	cmd := strings.ToLower(cmdParts[0])
 	var response string
-	switch cmdParts[0] {
+
+	switch cmd {
 	case "ping":
 		response = "pong"
 	case "status":
@@ -309,7 +318,6 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 				response = "Files: " + strings.Join(names, ", ")
 			}
 		}
-
 	case "info":
 		response = "ZTP Server v1.0 - Secure Transport Protocol"
 	case "echo":
@@ -330,7 +338,7 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 			break
 		}
 		sr.sessionKey = sess.Key
-		sr.roles[streamID] = sess.Role
+		sr.names[streamID] = clientID
 		response = "Session resumed for " + clientID
 	case "chatlist":
 		sessions.lock.RLock()
@@ -339,31 +347,38 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 			ids = append(ids, id)
 		}
 		sessions.lock.RUnlock()
-
 		if len(ids) == 0 {
 			response = "No active clients"
 		} else {
 			response = "Active clients: " + strings.Join(ids, ", ")
 		}
-
-	default:
-		if strings.HasPrefix(command, "chat @") {
-			sr.handleChatMessage(streamID, strings.TrimPrefix(command, "chat "))
+	case "chat":
+		// "chat" komutu sonrası mesaj var mı kontrol et
+		msg := strings.TrimSpace(strings.TrimPrefix(command, "chat"))
+		if msg == "" {
+			sr.sendResponse(streamID, "⚠️ Empty chat message.")
 			return
 		}
+
+		sr.handleChatMessage(streamID, msg)
+		return
+	default:
 		response = "Unknown command"
 	}
+
 	log.Printf("[Router] Stream %d: Control -> %s", streamID, command)
 	sr.sendResponse(streamID, response)
 }
 
+// Eğer mesaj "@clientID mesaj" şeklindeyse → Private Message
+// Eğer mesaj "chat mesaj" şeklindeyse → Broadcast Chat
 func (sr *StreamRouter) handleChatMessage(streamID uint32, message string) {
-	sender := sr.roles[streamID]
+	sender := sr.names[streamID]
 	if sender == "" {
 		sender = "unknown"
 	}
 
-	// 🎯 Eğer mesaj "@clientID mesaj" şeklindeyse → Private Message
+	// Eğer mesaj "@clientID mesaj" şeklindeyse → Private Message
 	if strings.HasPrefix(message, "@") {
 		parts := strings.SplitN(message, " ", 2)
 		if len(parts) != 2 {
@@ -374,10 +389,7 @@ func (sr *StreamRouter) handleChatMessage(streamID uint32, message string) {
 		targetID := strings.TrimPrefix(parts[0], "@")
 		content := parts[1]
 
-		sessions.lock.RLock()
-		targetSess, ok := sessions.store[targetID]
-		sessions.lock.RUnlock()
-
+		targetSess, ok := sessions.Load(targetID) // 🔁 Doğru yöntem
 		if !ok || targetSess.Writer == nil {
 			sr.sendResponse(streamID, fmt.Sprintf("⚠️ Client @%s not found or offline", targetID))
 			return
@@ -397,7 +409,7 @@ func (sr *StreamRouter) handleChatMessage(streamID uint32, message string) {
 		return
 	}
 
-	// 📣 Broadcast Chat
+	// Broadcast Chat
 	broadcastMsg := fmt.Sprintf("[Chat] %s: %s", sender, message)
 
 	sessions.lock.RLock()

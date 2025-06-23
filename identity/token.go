@@ -9,12 +9,12 @@ import (
 	"time"
 )
 
-var sharedSecret = []byte("supersecretkey123") // 🔐 Should be stored securely (env/config)
+var sharedSecret = []byte("supersecretkey123") //  Should be stored securely (env/config)
 
 // TokenClaims represents the identity claims encoded in a token
 type TokenClaims struct {
 	ClientID string    `json:"client_id"`
-	Role     string    `json:"role"` // ⭐ NEW field for dynamic roles
+	Role     string    `json:"role"` //  field for dynamic roles
 	Expires  time.Time `json:"expires"`
 }
 

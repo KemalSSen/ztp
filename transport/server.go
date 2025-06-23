@@ -106,17 +106,22 @@ func handleConnection(conn net.Conn) {
 	log.Printf("[ZTP] Authenticated client: %s with role: %s", claims.ClientID, claims.Role)
 	log.Println("[ZTP] Handshake complete. Secure session established.")
 	// Save client identity
-	sessions.SaveWriter(claims.ClientID, w)
+	//sessions.SaveWriter(claims.ClientID, w)
 	// Save session for resume
+	// Save session including Writer
 	sessions.Save(claims.ClientID, Session{
 		Key:      sessionKey,
 		Role:     claims.Role,
+		Writer:   w, // 🔥 Writer ekleniyor
 		LastSeen: time.Now(),
 	})
 
 	// --- Phase 3: Stream Routing ---
 	router := NewStreamRouter(sessionKey, w)
-	router.roles[1] = claims.Role // attach role to control stream
+	router.names[1] = claims.ClientID
+	router.names[3] = claims.ClientID // ✅ Chat mesajları için de client adı eşle
+
+	// attach role to control stream
 
 	for {
 		frame, err := protocol.Decode(r)
