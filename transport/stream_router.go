@@ -194,7 +194,7 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 	}
 
 	if _, exists := sr.names[frame.StreamID]; !exists {
-		sr.names[frame.StreamID] = sr.names[1]
+		sr.names[frame.StreamID] = sr.sessionKeyToClientID()
 	}
 
 	ch, exists := sr.streamChans[frame.StreamID]
@@ -204,6 +204,18 @@ func (sr *StreamRouter) Dispatch(frame *protocol.Frame) {
 		go sr.handleStream(frame.StreamID, ch)
 	}
 	ch <- frame
+}
+
+func (sr *StreamRouter) sessionKeyToClientID() string {
+	sessions.lock.RLock()
+	defer sessions.lock.RUnlock()
+
+	for id, sess := range sessions.store {
+		if sess.Key == sr.sessionKey {
+			return id
+		}
+	}
+	return "unknown"
 }
 
 func (sr *StreamRouter) startUpload(streamID uint32, command string) {
@@ -362,6 +374,12 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 
 		sr.handleChatMessage(streamID, msg)
 		return
+
+	case "":
+		if strings.HasPrefix(command, "@") {
+			sr.handleChatMessage(streamID, command)
+			return
+		}
 	default:
 		response = "Unknown command"
 	}
@@ -374,8 +392,9 @@ func (sr *StreamRouter) handleControlCommand(streamID uint32, command string) {
 // Eğer mesaj "chat mesaj" şeklindeyse → Broadcast Chat
 func (sr *StreamRouter) handleChatMessage(streamID uint32, message string) {
 	sender := sr.names[streamID]
-	if sender == "" {
-		sender = "unknown"
+	if sender == "" || sender == "unknown" {
+		sender = sr.sessionKeyToClientID() // fallback
+		sr.names[streamID] = sender        // güncelle
 	}
 
 	// Eğer mesaj "@clientID mesaj" şeklindeyse → Private Message
@@ -389,7 +408,7 @@ func (sr *StreamRouter) handleChatMessage(streamID uint32, message string) {
 		targetID := strings.TrimPrefix(parts[0], "@")
 		content := parts[1]
 
-		targetSess, ok := sessions.Load(targetID) // 🔁 Doğru yöntem
+		targetSess, ok := sessions.Load(targetID)
 		if !ok || targetSess.Writer == nil {
 			sr.sendResponse(streamID, fmt.Sprintf("⚠️ Client @%s not found or offline", targetID))
 			return
@@ -406,11 +425,12 @@ func (sr *StreamRouter) handleChatMessage(streamID uint32, message string) {
 
 		sr.sendResponse(streamID, fmt.Sprintf("✅ Sent private message to @%s", targetID))
 		log.Printf("[PM] %s -> %s: %s", sender, targetID, content)
-		return
+		return // 💥 Eksik olan buydu!
 	}
 
 	// Broadcast Chat
-	broadcastMsg := fmt.Sprintf("[Chat] %s: %s", sender, message)
+	cleaned := strings.TrimPrefix(message, "chat ")
+	broadcastMsg := fmt.Sprintf("[Chat] %s: %s", sender, strings.TrimSpace(cleaned))
 
 	sessions.lock.RLock()
 	defer sessions.lock.RUnlock()
@@ -481,7 +501,10 @@ func (sr *StreamRouter) handleStream(streamID uint32, ch chan *protocol.Frame) {
 			}
 			continue
 		}
-		message := string(plaintext)
+		message := strings.TrimSpace(string(plaintext))
+		if strings.HasPrefix(message, "chat ") {
+			message = strings.TrimPrefix(message, "chat ")
+		}
 
 		// Priority guessing if not already set
 		sr.lock.Lock()
